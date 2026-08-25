@@ -8,8 +8,8 @@ const schema = z.object({
   GMGN_API_KEY: z.string().optional(),
   GMGN_CHAIN: z.string().default("sol"),
   GMGN_LAUNCHPAD: z.string().default("Pump.fun"),
-  X_ENRICHMENT_URL: z.string().url().optional(),
-  X_ENRICHMENT_TOKEN: z.string().optional()
+  X_ENRICHMENT_URL: z.preprocess((value) => value === "" ? undefined : value, z.string().url().optional()),
+  X_ENRICHMENT_TOKEN: z.preprocess((value) => value === "" ? undefined : value, z.string().optional())
 });
 
 export const config = schema.parse(process.env);
