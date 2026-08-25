@@ -1,0 +1,26 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Token {
+  address       String   @id
+  symbol        String?
+  name          String?
+  bondingAt    DateTime
+  isOnCurve     Boolean
+  pumpUrl       String
+  twitterUrl    String?
+  websiteUrl    String?
+  xMentionCount Int?
+  rawData       Json
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([bondingAt])
+  @@index([xMentionCount])
+}
