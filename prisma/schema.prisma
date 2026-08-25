@@ -24,3 +24,8 @@ model Token {
   @@index([bondingAt])
   @@index([xMentionCount])
 }
+
+model Chat {
+  chatId    BigInt   @id
+  createdAt DateTime @default(now())
+}

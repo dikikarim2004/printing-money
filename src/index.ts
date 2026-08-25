@@ -1,8 +1,8 @@
 import { config } from "./config.js";
 import { discoverBondingCurveTokens } from "./gmgn.js";
 import { enrichSocial } from "./enrichment.js";
-import { prisma, saveToken } from "./repository.js";
-import { bot, setLatestScreeningStatus } from "./telegram.js";
+import { prisma, pumpUrl, saveToken } from "./repository.js";
+import { bot, notifyNewToken, setLatestScreeningStatus } from "./telegram.js";
 
 let polling = false;
 async function scan(): Promise<void> {
@@ -15,8 +15,12 @@ async function scan(): Promise<void> {
     console.log(status);
     for (const token of tokens) {
       try {
-        await saveToken(token, await enrichSocial(token));
+        const social = await enrichSocial(token);
+        const { isNew } = await saveToken(token, social);
         console.log(`Bonding curve detected by GMGN | ${token.symbol ?? token.name ?? "Unknown token"} | ${token.address} | ${token.bondingAt.toISOString()} | is_on_curve=${String(token.isOnCurve)}`);
+        if (isNew) {
+          await notifyNewToken({ ...token, pumpUrl: pumpUrl(token.address), xMentionCount: social.xMentionCount ?? null });
+        }
       } catch (error) {
         console.error(`Could not save ${token.address}:`, error);
       }
@@ -33,7 +37,10 @@ async function scan(): Promise<void> {
 }
 
 await prisma.$connect();
-await bot.start({ onStart: () => console.log("Telegram bot started") });
+void bot.start({ onStart: () => console.log("Telegram bot started") }).catch((error) => {
+  console.error("Telegram polling failed:", error);
+  process.exit(1);
+});
 await scan();
 setInterval(() => void scan(), config.POLL_INTERVAL_SECONDS * 1000);
 
