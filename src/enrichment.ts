@@ -6,7 +6,7 @@ export type SocialEnrichment = {
   xMentionCount?: number;
 };
 
-export async function enrichSocial(token: DiscoveredToken): Promise<SocialEnrichment> {
+export async function enrichSocial(token: Pick<DiscoveredToken, "address" | "twitterUrl">): Promise<SocialEnrichment> {
   if (!config.X_ENRICHMENT_URL) return { twitterUrl: token.twitterUrl };
   const response = await fetch(config.X_ENRICHMENT_URL, {
     method: "POST",
