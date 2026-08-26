@@ -1,7 +1,7 @@
 import { Bot, Context, InlineKeyboard, Keyboard } from "grammy";
 import { config } from "./config.js";
-import { hasNextPage, listChatIds, listTokens, registerChat } from "./repository.js";
-import type { TokenListItem } from "./types.js";
+import { hasNextPage, hasNextUnboundedPage, listChatIds, listTokens, listUnboundedTokens, registerChat } from "./repository.js";
+import type { TokenListItem, UnboundedTokenListItem } from "./types.js";
 
 const bot = new Bot(config.TELEGRAM_BOT_TOKEN);
 bot.catch((error) => {
@@ -25,6 +25,8 @@ const menuKeyboard = new Keyboard()
   .row()
   .text("Top mention X")
   .text("Status screening")
+  .row()
+  .text("Good Unbounded Token")
   .resized()
   .persistent();
 
@@ -66,6 +68,28 @@ function render(tokens: TokenListItem[], title: string): string {
   return `${escapeHtml(title)}\n\n${tokens.map((token, index) => `${index + 1}. ${renderTokenRow(token, now)}`).join("\n\n")}`;
 }
 
+// Good Unbounded Token: bonding curve not yet 100%, but dex paid, bundler <= 20%, organic, low rug risk.
+function renderUnboundedTokenRow(token: UnboundedTokenListItem, now: Date): string {
+  const label = token.symbol ?? token.name ?? token.address.slice(0, 8);
+  const fields: [string, string][] = [
+    ["Symbol", label],
+    ["Progress", `${(token.progress * 100).toFixed(1)}%`],
+    ["Rug ratio", token.rugRatio !== undefined ? token.rugRatio.toFixed(3) : "-"],
+    ["Terdeteksi pada", `${dateFormatter.format(token.createdAt)} UTC`],
+    ["Sudah berjalan", formatElapsed(token.createdAt, now)],
+    ["X mentions", String(token.xMentionCount ?? "-")]
+  ];
+  const labelWidth = Math.max(...fields.map(([key]) => key.length));
+  const table = fields.map(([key, value]) => `${key.padEnd(labelWidth)} : ${value}`).join("\n");
+  return `<pre>${escapeHtml(table)}</pre>\nAddress: <code>${escapeHtml(token.address)}</code>\n<a href="${escapeHtml(token.pumpUrl)}">Buka di Pump.fun</a>`;
+}
+
+function renderUnbounded(tokens: UnboundedTokenListItem[], title: string): string {
+  if (!tokens.length) return `${escapeHtml(title)}\n\nBelum ada token tersimpan.`;
+  const now = new Date();
+  return `${escapeHtml(title)}\n\n${tokens.map((token, index) => `${index + 1}. ${renderUnboundedTokenRow(token, now)}`).join("\n\n")}`;
+}
+
 async function sendTimeList(ctx: Context, page: number, windowHours?: number): Promise<void> {
   const tokens = await listTokens("time", page, 10, windowHours);
   const keyboard = new InlineKeyboard();
@@ -76,12 +100,22 @@ async function sendTimeList(ctx: Context, page: number, windowHours?: number): P
   await ctx.reply(render(tokens, title), { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: keyboard });
 }
 
+async function sendUnboundedList(ctx: Context, page: number): Promise<void> {
+  const tokens = await listUnboundedTokens(page);
+  const keyboard = new InlineKeyboard();
+  if (page > 1) keyboard.text("Previous", `unbounded:${page - 1}`);
+  if (await hasNextUnboundedPage(page)) keyboard.text("Continue", `unbounded:${page + 1}`);
+  const title = `Good Unbounded Token (belum 100%, dex paid, bundler <= 20%, organik), halaman ${page}`;
+  await ctx.reply(renderUnbounded(tokens, title), { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: keyboard });
+}
+
 const menuText = "Pump.fun bonding curve monitor aktif. Pilih menu:";
 bot.command("start", (ctx) => ctx.reply(menuText, { reply_markup: menuKeyboard }));
 bot.command("menu", (ctx) => ctx.reply(menuText, { reply_markup: menuKeyboard }));
 bot.command("status", (ctx) => ctx.reply(latestScreeningStatus, { reply_markup: menuKeyboard }));
 bot.command("latest", (ctx) => sendTimeList(ctx, 1, 24));
 bot.command("all", (ctx) => sendTimeList(ctx, 1));
+bot.command("unbounded", (ctx) => sendUnboundedList(ctx, 1));
 bot.command("topmentions", async (ctx) => {
   const tokens = await listTokens("mentions", 1);
   await ctx.reply(render(tokens, "Top 10 berdasarkan mention X"), { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
@@ -90,6 +124,10 @@ bot.callbackQuery(/^tokens:time:(24|all):(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   await sendTimeList(ctx, Number(ctx.match[2]), ctx.match[1] === "24" ? 24 : undefined);
 });
+bot.callbackQuery(/^unbounded:(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await sendUnboundedList(ctx, Number(ctx.match[1]));
+});
 
 bot.hears("Token terbaru", (ctx) => sendTimeList(ctx, 1, 24));
 bot.hears("Semua token", (ctx) => sendTimeList(ctx, 1));
@@ -97,6 +135,7 @@ bot.hears("Top mention X", async (ctx) => {
   const tokens = await listTokens("mentions", 1);
   await ctx.reply(render(tokens, "Top 10 berdasarkan mention X"), { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: menuKeyboard });
 });
+bot.hears("Good Unbounded Token", (ctx) => sendUnboundedList(ctx, 1));
 bot.hears("Status screening", (ctx) => ctx.reply(latestScreeningStatus, { reply_markup: menuKeyboard }));
 
 export function setLatestScreeningStatus(message: string): void {
@@ -106,12 +145,29 @@ export function setLatestScreeningStatus(message: string): void {
 export async function notifyNewToken(token: TokenListItem): Promise<void> {
   const chatIds = await listChatIds();
   if (!chatIds.length) return;
-  const message = `Token baru 100% bonding curve (bundler <= 20%, dex paid)!\n\n${renderTokenRow(token, new Date())}`;
+  // The literal "<=" in the header must be HTML-escaped, otherwise Telegram's HTML parser
+  // treats "<" as a tag start and rejects the whole message (verified via GrammyError 400 in logs).
+  const header = escapeHtml("Token baru 100% bonding curve (bundler <= 20%, dex paid)!");
+  const message = `${header}\n\n${renderTokenRow(token, new Date())}`;
   for (const chatId of chatIds) {
     try {
       await bot.api.sendMessage(chatId, message, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
     } catch (error) {
       console.error(`Gagal mengirim notifikasi ke chat ${chatId}:`, error);
+    }
+  }
+}
+
+export async function notifyNewUnboundedToken(token: UnboundedTokenListItem): Promise<void> {
+  const chatIds = await listChatIds();
+  if (!chatIds.length) return;
+  const header = escapeHtml("Good Unbounded Token terdeteksi (bonding curve belum 100%, dex paid, bundler <= 20%, organik, rug risk rendah)!");
+  const message = `${header}\n\n${renderUnboundedTokenRow(token, new Date())}`;
+  for (const chatId of chatIds) {
+    try {
+      await bot.api.sendMessage(chatId, message, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    } catch (error) {
+      console.error(`Gagal mengirim notifikasi unbounded ke chat ${chatId}:`, error);
     }
   }
 }

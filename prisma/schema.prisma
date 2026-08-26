@@ -29,3 +29,21 @@ model Chat {
   chatId    BigInt   @id
   createdAt DateTime @default(now())
 }
+
+model TokenUnboundedFilter {
+  address       String   @id
+  symbol        String?
+  name          String?
+  progress      Float
+  rugRatio      Float?
+  pumpUrl       String
+  twitterUrl    String?
+  websiteUrl    String?
+  xMentionCount Int?
+  rawData       Json
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([createdAt])
+  @@map("token_unbounded_filter")
+}
