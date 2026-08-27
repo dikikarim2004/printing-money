@@ -35,6 +35,88 @@ model Chat {
   createdAt DateTime @default(now())
 }
 
+model TelegramUser {
+  telegramId          BigInt   @id
+  username            String?
+  walletAddress       String   @unique
+  encryptedPrivateKey String
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@map("telegram_users")
+}
+
+model EarlyToken {
+  address        String   @id
+  symbol         String?
+  name           String?
+  progress       Float
+  rugRatio       Float?
+  marketCap      Float?
+  athMarketCap   Float?
+  pumpUrl        String
+  twitterUrl     String?
+  websiteUrl     String?
+  xMentionCount  Int?
+  jumlah_volume  Float?
+  tokenCreatedAt DateTime
+  rawData        Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([createdAt])
+  @@map("early_token")
+}
+
+model KonfigTrader {
+  telegramId                 BigInt  @id
+  solAmountTradePerPosition  Float   @default(0.001)
+  maxTradePositions          Int     @default(1)
+  takeProfit1SellPercent     Float   @default(100)
+  takeProfit1TargetPercent   Float   @default(200)
+  takeProfit2TargetPercent   Float   @default(1000)
+  heliusRpcUrl               String  @default("https://mainnet.helius-rpc.com")
+  heliusApiKey               String?
+  statusAutoTradeBot         Boolean @default(false)
+  statusDryRun               Boolean @default(true)
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  @@map("konfig_traders")
+}
+
+enum TradePositionStatus {
+  OPEN
+  CLOSE
+}
+
+model TradePosition {
+  id                    String              @id @default(cuid())
+  txHash                String?
+  telegramId            BigInt
+  amountSol             Float
+  tokenPrice            Float
+  tokenSymbol           String?
+  tokenAddress          String
+  tokenAmount           Float
+  tokenDecimals         Int                 @default(6)
+  currentPriceSol       Float?
+  takeProfit1Sol        Float?
+  takeProfit2Sol        Float?
+  takeProfit1Executed   Boolean             @default(false)
+  takeProfit2Executed   Boolean             @default(false)
+  takeProfit1TxHash     String?
+  takeProfit2TxHash     String?
+  lastPriceAt            DateTime?
+  status                TradePositionStatus @default(OPEN)
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+
+  @@index([telegramId, status])
+  @@index([tokenAddress, status])
+  @@map("trade_position")
+}
+
 model TokenUnboundedFilter {
   address       String   @id
   symbol        String?

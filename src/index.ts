@@ -1,8 +1,9 @@
 import { config } from "./config.js";
-import { discoverBondingCurveTokens, discoverUnboundedTokens, fetchAthMarketCap } from "./gmgn.js";
+import { discoverBondingCurveTokens, discoverEarlyTokens, discoverUnboundedTokens, fetchAthMarketCap } from "./gmgn.js";
 import { enrichSocial } from "./enrichment.js";
-import { prisma, pumpUrl, pruneExpiredUnboundedTokens, removeCompletedFromUnbounded, getUnboundedVolumes, saveToken, saveUnboundedToken } from "./repository.js";
-import { bot, notifyNewToken, notifyNewUnboundedToken, setLatestScreeningStatus } from "./telegram.js";
+import { prisma, pumpUrl, pruneExpiredUnboundedTokens, removeCompletedFromUnbounded, getUnboundedVolumes, saveEarlyToken, saveToken, saveUnboundedToken } from "./repository.js";
+import { bot, notifyNewEarlyToken, notifyNewToken, notifyNewUnboundedToken, setLatestScreeningStatus } from "./telegram.js";
+import { handleEarlyTokenForAutoTrade, startAutoTradeWorker } from "./autotrade.js";
 
 let polling = false;
 async function scan(): Promise<void> {
@@ -65,6 +66,21 @@ async function scan(): Promise<void> {
     // that previously caused just-notified tokens to disappear within minutes (verified: bundler_trader_amount_rate
     // rose from <=20% at capture to 22.92% nine minutes later for the same token).
     await pruneExpiredUnboundedTokens(60 * 60 * 1000);
+
+    const earlyTokens = await discoverEarlyTokens();
+    for (const token of earlyTokens) {
+      try {
+        const social = await enrichSocial(token);
+        if (social.mentionCheckFailed || !social.xMentionCount || social.xMentionCount < 1) continue;
+        const { isNew } = await saveEarlyToken(token, social);
+        if (isNew) {
+          await notifyNewEarlyToken({ ...token, pumpUrl: pumpUrl(token.address), xMentionCount: social.xMentionCount, jumlah_volume: token.volume24h ?? null, athMarketCap: null, createdAt: new Date() });
+          await handleEarlyTokenForAutoTrade(token);
+        }
+      } catch (error) {
+        console.error(`Could not save early token ${token.address}:`, error);
+      }
+    }
   } catch (error) {
     console.error("Scan failed:", error);
     const message = `Screening gagal: ${error instanceof Error ? error.message : "unknown error"}`;
@@ -83,7 +99,11 @@ await bot.api.setMyCommands([
   { command: "latest", description: "Token terbaru" },
   { command: "all", description: "Semua token" },
   { command: "unbounded", description: "Good Unbounded Token" },
-  { command: "topmentions", description: "Top mention X" }
+  { command: "topmentions", description: "Top mention X" },
+  { command: "early", description: "Early Token" },
+  { command: "wallet", description: "Wallet SOL" },
+  { command: "configtrade", description: "Konfigurasi auto-trade" },
+  { command: "tradepositions", description: "Open trade positions" }
 ]);
 await bot.api.setChatMenuButton({ menu_button: { type: "commands" } });
 void bot.start({ onStart: () => console.log("Telegram bot started") }).catch((error) => {
@@ -92,6 +112,7 @@ void bot.start({ onStart: () => console.log("Telegram bot started") }).catch((er
 });
 await scan();
 setInterval(() => void scan(), config.POLL_INTERVAL_SECONDS * 1000);
+startAutoTradeWorker();
 
 const shutdown = async () => {
   await bot.stop();

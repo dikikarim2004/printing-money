@@ -1,6 +1,7 @@
 import { Prisma, PrismaClient } from "@prisma/client";
-import type { DiscoveredToken, TokenListItem, UnboundedDiscoveredToken, UnboundedTokenListItem } from "./types.js";
+import type { DiscoveredToken, EarlyDiscoveredToken, EarlyTokenListItem, TokenListItem, UnboundedDiscoveredToken, UnboundedTokenListItem } from "./types.js";
 import type { SocialEnrichment } from "./enrichment.js";
+import { generateWallet } from "./wallet.js";
 
 export const prisma = new PrismaClient();
 export const pumpUrl = (address: string) => `https://pump.fun/coin/${encodeURIComponent(address)}`;
@@ -32,6 +33,107 @@ export async function registerChat(chatId: number): Promise<void> {
   await prisma.chat.upsert({ where: { chatId: BigInt(chatId) }, create: { chatId: BigInt(chatId) }, update: {} });
 }
 
+export async function registerTelegramUser(telegramId: number, username?: string) {
+  const wallet = generateWallet();
+  return prisma.telegramUser.upsert({
+    where: { telegramId: BigInt(telegramId) },
+    create: { telegramId: BigInt(telegramId), username, walletAddress: wallet.address, encryptedPrivateKey: wallet.encryptedPrivateKey },
+    update: { username }
+  });
+}
+
+export function getTelegramUser(telegramId: number) {
+  return prisma.telegramUser.findUnique({ where: { telegramId: BigInt(telegramId) } });
+}
+
+export function getTraderConfig(telegramId: number) {
+  return prisma.konfigTrader.upsert({
+    where: { telegramId: BigInt(telegramId) },
+    create: { telegramId: BigInt(telegramId) },
+    update: {}
+  });
+}
+
+export function updateTraderConfig(telegramId: number, data: {
+  solAmountTradePerPosition?: number;
+  maxTradePositions?: number;
+  takeProfit1SellPercent?: number;
+  takeProfit1TargetPercent?: number;
+  takeProfit2TargetPercent?: number;
+  heliusApiKey?: string | null;
+  heliusRpcUrl?: string;
+  statusAutoTradeBot?: boolean;
+  statusDryRun?: boolean;
+}) {
+  return prisma.konfigTrader.update({ where: { telegramId: BigInt(telegramId) }, data });
+}
+
+export function listOpenTradePositions(telegramId: number) {
+  return prisma.tradePosition.findMany({
+    where: { telegramId: BigInt(telegramId), status: "OPEN" },
+    orderBy: { createdAt: "desc" }
+  });
+}
+
+export function listAutoTradeConfigs() {
+  return prisma.konfigTrader.findMany({ where: { statusAutoTradeBot: true } });
+}
+
+export function countOpenTradePositions(telegramId: bigint) {
+  return prisma.tradePosition.count({ where: { telegramId, status: "OPEN" } });
+}
+
+export function findOpenTradePosition(telegramId: bigint, tokenAddress: string) {
+  return prisma.tradePosition.findFirst({ where: { telegramId, tokenAddress, status: "OPEN" } });
+}
+
+export function createTradePosition(data: {
+  txHash?: string;
+  telegramId: bigint;
+  amountSol: number;
+  tokenPrice: number;
+  tokenSymbol?: string;
+  tokenAddress: string;
+  tokenAmount: number;
+  tokenDecimals: number;
+}) {
+  return prisma.tradePosition.create({ data });
+}
+
+export function updateTradePosition(id: string, data: {
+  tokenAmount?: number;
+  currentPriceSol?: number;
+  takeProfit1Sol?: number;
+  takeProfit2Sol?: number;
+  takeProfit1Executed?: boolean;
+  takeProfit2Executed?: boolean;
+  takeProfit1TxHash?: string;
+  takeProfit2TxHash?: string;
+  status?: "OPEN" | "CLOSE";
+  lastPriceAt?: Date;
+}) {
+  return prisma.tradePosition.update({ where: { id }, data });
+}
+
+export async function saveEarlyToken(token: EarlyDiscoveredToken, social: SocialEnrichment): Promise<{ isNew: boolean }> {
+  const rawData = JSON.parse(JSON.stringify(token.rawData)) as Prisma.InputJsonValue;
+  const existing = await prisma.earlyToken.findUnique({ where: { address: token.address }, select: { address: true } });
+  await prisma.earlyToken.upsert({
+    where: { address: token.address },
+    create: { address: token.address, symbol: token.symbol, name: token.name, progress: token.progress, rugRatio: token.rugRatio, marketCap: token.marketCap ?? null, pumpUrl: pumpUrl(token.address), twitterUrl: social.twitterUrl ?? token.twitterUrl, xMentionCount: social.xMentionCount, jumlah_volume: token.volume24h ?? null, tokenCreatedAt: token.tokenCreatedAt, rawData },
+    update: { symbol: token.symbol, name: token.name, progress: token.progress, rugRatio: token.rugRatio, marketCap: token.marketCap ?? null, twitterUrl: social.twitterUrl ?? token.twitterUrl, xMentionCount: social.xMentionCount, jumlah_volume: token.volume24h ?? null, rawData }
+  });
+  return { isNew: !existing };
+}
+
+export async function listEarlyTokens(page: number, pageSize = 10): Promise<EarlyTokenListItem[]> {
+  const tokens = await prisma.earlyToken.findMany({ orderBy: { createdAt: "desc" }, skip: Math.max(0, page - 1) * pageSize, take: pageSize });
+  return tokens.map((token) => ({ ...token, symbol: token.symbol ?? undefined, name: token.name ?? undefined, rugRatio: token.rugRatio ?? undefined, marketCap: token.marketCap ?? undefined, twitterUrl: token.twitterUrl ?? undefined, websiteUrl: token.websiteUrl ?? undefined }));
+}
+
+export function hasNextEarlyPage(page: number, pageSize = 10): Promise<boolean> {
+  return prisma.earlyToken.count().then((count) => count > page * pageSize);
+}
 export async function listChatIds(): Promise<number[]> {
   const chats = await prisma.chat.findMany({ select: { chatId: true } });
   return chats.map((chat) => Number(chat.chatId));

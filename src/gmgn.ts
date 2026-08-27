@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { config } from "./config.js";
-import type { DiscoveredToken, UnboundedDiscoveredToken } from "./types.js";
+import type { DiscoveredToken, EarlyDiscoveredToken, UnboundedDiscoveredToken } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -140,7 +140,7 @@ function normalizeToken(record: Record<string, unknown>): DiscoveredToken | null
   const withinLast24Hours = bondingAt !== null && Date.now() - bondingAt.getTime() <= 24 * 60 * 60 * 1000;
   // Token age gate: `created_timestamp` is when the token contract itself was created; must be <= 1 hour old.
   const tokenCreatedAt = parseDate(record.created_timestamp);
-  const isYoungEnough = tokenCreatedAt !== null && Date.now() - tokenCreatedAt.getTime() <= 90 * 60 * 1000;
+  const isYoungEnough = tokenCreatedAt !== null && Date.now() - tokenCreatedAt.getTime() <= 60 * 60 * 1000;
   // Dex-paid status is now verified live via DexScreener's /orders/v1 endpoint (see discoverBondingCurveTokens),
   // not GMGN's own dexscr_update_link field.
   const isOnCurve = reachedFullBondingCurve && withinLast24Hours && isYoungEnough;
@@ -205,7 +205,7 @@ function normalizeUnboundedToken(record: Record<string, unknown>): UnboundedDisc
   const isOrganic = record.is_wash_trading === false;
   // Token age gate: `created_timestamp` is when the token contract itself was created; must be <= 1 hour old.
   const tokenCreatedAt = parseDate(record.created_timestamp);
-  const isYoungEnough = tokenCreatedAt !== null && Date.now() - tokenCreatedAt.getTime() <= 90 * 60 * 1000;
+  const isYoungEnough = tokenCreatedAt !== null && Date.now() - tokenCreatedAt.getTime() <= 60 * 60 * 1000;
   if (!address || !notYetCompleted || !isOrganic || !tokenCreatedAt || !isYoungEnough) return null;
   const progress = typeof record.progress === "number" ? record.progress : 0;
   const rugRatio = typeof record.rug_ratio === "number" ? record.rug_ratio : undefined;
@@ -247,4 +247,44 @@ export async function discoverUnboundedTokens(): Promise<DiscoveryResult<Unbound
   const tokens = candidates.filter((_, index) => dexPaidChecks[index].paid && dexPaidChecks[index].checked);
   const reliable = dexPaidChecks.every((check) => check.checked);
   return { tokens, reliable };
+}
+
+export async function discoverEarlyTokens(): Promise<EarlyDiscoveredToken[]> {
+  const args = ["market", "trenches", "--chain", config.GMGN_CHAIN, "--type", "new_creation", "--launchpad-platform", config.GMGN_LAUNCHPAD, "--limit", "80", "--raw"];
+  const { stdout } = await execFileAsync(config.GMGN_CLI_BIN, args, {
+    env: { ...process.env, ...(config.GMGN_API_KEY ? { GMGN_API_KEY: config.GMGN_API_KEY } : {}) },
+    maxBuffer: 10 * 1024 * 1024
+  });
+  let payload: unknown;
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    throw new Error("GMGN CLI returned non-JSON output");
+  }
+  return recordsFromPayload(payload, ["new_creation"])
+    .filter((record) => typeof record.market_cap === "number" && record.market_cap >= 2000 && record.market_cap < 3000 && typeof record.ath_price !== "number" && typeof record.volume_24h === "number" && record.volume_24h >= 20000)
+    .map(normalizeEarlyToken)
+    .filter((token): token is EarlyDiscoveredToken => token !== null);
+}
+
+function normalizeEarlyToken(record: Record<string, unknown>): EarlyDiscoveredToken | null {
+  const address = firstString(record, ["address", "token_address", "tokenAddress", "ca"]);
+  const tokenCreatedAt = parseDate(record.created_timestamp);
+  if (!address || !tokenCreatedAt) return null;
+  return {
+    address,
+    symbol: firstString(record, ["symbol", "token_symbol"]),
+    name: firstString(record, ["name", "token_name"]),
+    progress: typeof record.progress === "number" ? record.progress : 0,
+    rugRatio: typeof record.rug_ratio === "number" ? record.rug_ratio : undefined,
+    twitterUrl: firstString(record, ["twitter", "twitter_username", "twitter_url"]),
+    twitterStatusPath: firstString(record, ["twitter"]),
+    twitterIsTweet: record.twitter_is_tweet === true,
+    websiteUrl: firstString(record, ["website", "website_url"]),
+    volume24h: typeof record.volume_24h === "number" ? record.volume_24h : undefined,
+    marketCap: typeof record.market_cap === "number" ? record.market_cap : undefined,
+    totalSupply: typeof record.total_supply === "number" ? record.total_supply : undefined,
+    tokenCreatedAt,
+    rawData: record
+  };
 }

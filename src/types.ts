@@ -58,3 +58,13 @@ export type UnboundedTokenListItem = UnboundedDiscoveredToken & {
   athMarketCap: number | null;
   createdAt: Date;
 };
+
+export type EarlyDiscoveredToken = UnboundedDiscoveredToken;
+
+export type EarlyTokenListItem = EarlyDiscoveredToken & {
+  pumpUrl: string;
+  xMentionCount: number | null;
+  jumlah_volume: number | null;
+  athMarketCap: number | null;
+  createdAt: Date;
+};
