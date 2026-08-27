@@ -17,6 +17,11 @@ model Token {
   twitterUrl    String?
   websiteUrl    String?
   xMentionCount Int?
+  jumlah_volume Float?
+  rugRatio      Float?
+  marketCap     Float?
+  athMarketCap  Float?
+  tokenCreatedAt DateTime
   rawData       Json
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
@@ -36,10 +41,14 @@ model TokenUnboundedFilter {
   name          String?
   progress      Float
   rugRatio      Float?
+  marketCap     Float?
+  athMarketCap  Float?
   pumpUrl       String
   twitterUrl    String?
   websiteUrl    String?
   xMentionCount Int?
+  jumlah_volume Float?
+  tokenCreatedAt DateTime
   rawData       Json
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
