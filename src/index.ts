@@ -1,14 +1,16 @@
 import { config } from "./config.js";
-import { discoverBondingCurveTokens, discoverUnboundedTokens, fetchAthMarketCap } from "./gmgn.js";
+import { discoverBondingCurveTokens, discoverEarlyTokens, discoverUnboundedTokens, fetchAthMarketCap } from "./gmgn.js";
 import { enrichSocial } from "./enrichment.js";
-import { prisma, pumpUrl, pruneExpiredUnboundedTokens, removeCompletedFromUnbounded, getUnboundedVolumes, saveToken, saveUnboundedToken } from "./repository.js";
-import { bot, notifyNewToken, notifyNewUnboundedToken, setLatestScreeningStatus } from "./telegram.js";
+import { prisma, pumpUrl, pruneExpiredUnboundedTokens, removeCompletedFromUnbounded, getUnboundedVolumes, saveEarlyToken, saveToken, saveUnboundedToken } from "./repository.js";
+import { bot, notifyNewEarlyToken, notifyNewToken, notifyNewUnboundedToken, setLatestScreeningStatus } from "./telegram.js";
+import { handleEarlyTokenForAutoTrade, startAutoTradeWorker } from "./autotrade.js";
 
 let polling = false;
 async function scan(): Promise<void> {
   if (polling) return;
   polling = true;
   try {
+    console.log("Scan stage: completed bonding curve discovery");
     const { tokens } = await discoverBondingCurveTokens();
     const status = `Screening selesai | ${new Date().toISOString()} | ${tokens.length} token bonding curve terverifikasi oleh GMGN`;
     setLatestScreeningStatus(status);
@@ -20,7 +22,7 @@ async function scan(): Promise<void> {
       try {
         const social = await enrichSocial(token);
         // Point 1a: no X mentions means we skip saving/notifying entirely, not just hiding the count.
-        if (!social.xMentionCount || social.xMentionCount < 1) continue;
+        if (social.xMentionCount === undefined || social.xMentionCount < config.GMGN_COMPLETED_MIN_X_MENTIONS) continue;
         const preCompletionVolume = preCompletionVolumes.get(token.address);
         // Fetched only now (after every other filter already passed) to avoid wasting GMGN calls on candidates
         // that end up skipped anyway.
@@ -40,6 +42,7 @@ async function scan(): Promise<void> {
     await removeCompletedFromUnbounded(tokens.map((token) => token.address));
     console.log(`Scan complete: ${tokens.length} verified bonding-curve token(s)`);
 
+    console.log("Scan stage: unbounded discovery");
     const { tokens: unboundedTokens } = await discoverUnboundedTokens();
     for (const token of unboundedTokens) {
       try {
@@ -48,7 +51,7 @@ async function scan(): Promise<void> {
         // this cycle rather than guessing, but do not treat it as a disqualification signal.
         if (social.mentionCheckFailed) continue;
         // Point 1a: no X mentions means we skip saving/notifying entirely, not just hiding the count.
-        if (!social.xMentionCount || social.xMentionCount < 1) continue;
+        if (social.xMentionCount === undefined || social.xMentionCount < config.GMGN_UNBOUNDED_MIN_X_MENTIONS) continue;
         const athMarketCap = await fetchAthMarketCap(config.GMGN_CHAIN, token.address, token.totalSupply);
         const { isNew } = await saveUnboundedToken(token, social, athMarketCap);
         if (isNew) {
@@ -65,6 +68,22 @@ async function scan(): Promise<void> {
     // that previously caused just-notified tokens to disappear within minutes (verified: bundler_trader_amount_rate
     // rose from <=20% at capture to 22.92% nine minutes later for the same token).
     await pruneExpiredUnboundedTokens(60 * 60 * 1000);
+
+    console.log("Scan stage: early discovery");
+    const earlyTokens = await discoverEarlyTokens();
+    for (const token of earlyTokens) {
+      try {
+        const social = await enrichSocial(token);
+        if (social.mentionCheckFailed || social.xMentionCount === undefined || social.xMentionCount < config.GMGN_EARLY_MIN_X_MENTIONS) continue;
+        const { isNew } = await saveEarlyToken(token, social);
+        if (isNew) {
+          await handleEarlyTokenForAutoTrade(token);
+          await notifyNewEarlyToken({ ...token, pumpUrl: pumpUrl(token.address), xMentionCount: social.xMentionCount, jumlah_volume: token.volume24h ?? null, athMarketCap: null, createdAt: new Date() });
+        }
+      } catch (error) {
+        console.error(`Could not save early token ${token.address}:`, error);
+      }
+    }
   } catch (error) {
     console.error("Scan failed:", error);
     const message = `Screening gagal: ${error instanceof Error ? error.message : "unknown error"}`;
@@ -83,7 +102,11 @@ await bot.api.setMyCommands([
   { command: "latest", description: "Token terbaru" },
   { command: "all", description: "Semua token" },
   { command: "unbounded", description: "Good Unbounded Token" },
-  { command: "topmentions", description: "Top mention X" }
+  { command: "topmentions", description: "Top mention X" },
+  { command: "early", description: "Early Token" },
+  { command: "wallet", description: "Wallet SOL" },
+  { command: "configtrade", description: "Konfigurasi auto-trade" },
+  { command: "tradepositions", description: "Open trade positions" }
 ]);
 await bot.api.setChatMenuButton({ menu_button: { type: "commands" } });
 void bot.start({ onStart: () => console.log("Telegram bot started") }).catch((error) => {
@@ -92,6 +115,7 @@ void bot.start({ onStart: () => console.log("Telegram bot started") }).catch((er
 });
 await scan();
 setInterval(() => void scan(), config.POLL_INTERVAL_SECONDS * 1000);
+startAutoTradeWorker();
 
 const shutdown = async () => {
   await bot.stop();
