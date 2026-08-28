@@ -1,7 +1,7 @@
 import type { EarlyDiscoveredToken } from "./types.js";
 import { executeJupiterSwap, getTokenPriceInSol, SOL_MINT } from "./jupiter.js";
 import { config } from "./config.js";
-import { createTradePosition, countOpenTradePositions, findOpenTradePosition, getTelegramUser, listAutoTradeConfigs, listOpenTradePositions, updateTradePosition } from "./repository.js";
+import { createTradePosition, countOpenTradePositions, findOpenTradePosition, getTelegramUser, getTraderConfig, listAutoTradeConfigs, listOpenTradePositions, updateTradePosition } from "./repository.js";
 import { notifyAutoTradeFailure } from "./telegram.js";
 
 const SOL_DECIMALS = 9;
@@ -24,7 +24,7 @@ function orderAmount(order: { outputAmount?: string }): number {
   return Number(order.outputAmount);
 }
 
-function formatAutoTradeError(error: unknown): string {
+export function formatAutoTradeError(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
   const details = error as Error & { signature?: unknown; transactionLogs?: unknown; logs?: unknown };
   const lines = [error.message];
@@ -34,14 +34,20 @@ function formatAutoTradeError(error: unknown): string {
   return lines.join("\n");
 }
 
-async function openForUser(token: EarlyDiscoveredToken, trader: Awaited<ReturnType<typeof listAutoTradeConfigs>>[number]): Promise<void> {
+async function openForUser(token: EarlyDiscoveredToken, trader: Awaited<ReturnType<typeof listAutoTradeConfigs>>[number], throwOnFailure = false): Promise<Awaited<ReturnType<typeof executeJupiterSwap>> | undefined> {
   const telegramId = trader.telegramId;
   const lockKey = `${telegramId}:${token.address}`;
   if (tokenLocks.has(lockKey)) return;
   tokenLocks.add(lockKey);
   try {
-    if (await findOpenTradePosition(telegramId, token.address)) return;
-    if (await countOpenTradePositions(telegramId) >= trader.maxTradePositions) return;
+    if (await findOpenTradePosition(telegramId, token.address)) {
+      if (throwOnFailure) throw new Error("Posisi OPEN untuk token ini sudah ada");
+      return;
+    }
+    if (await countOpenTradePositions(telegramId) >= trader.maxTradePositions) {
+      if (throwOnFailure) throw new Error(`Maksimal posisi OPEN (${trader.maxTradePositions}) sudah tercapai`);
+      return;
+    }
     const user = await getTelegramUser(Number(telegramId));
     if (!user) throw new Error(`Telegram wallet not found for ${telegramId}`);
     const decimals = tokenDecimals(token);
@@ -62,9 +68,11 @@ async function openForUser(token: EarlyDiscoveredToken, trader: Awaited<ReturnTy
       tokenDecimals: decimals
     });
     console.log(`Auto-trade ${trader.statusDryRun ? "DRY-RUN" : "BUY"} | user=${telegramId} | token=${token.symbol ?? token.address} | amount=${trader.solAmountTradePerPosition} SOL`);
+    return buy;
   } catch (error) {
     console.error(`Auto-trade BUY failed | user=${telegramId} | token=${token.address}:`, error);
-    await notifyAutoTradeFailure(telegramId, token.address, formatAutoTradeError(error));
+    if (!throwOnFailure) await notifyAutoTradeFailure(telegramId, token.address, formatAutoTradeError(error));
+    if (throwOnFailure) throw error;
   } finally {
     tokenLocks.delete(lockKey);
   }
@@ -73,6 +81,19 @@ async function openForUser(token: EarlyDiscoveredToken, trader: Awaited<ReturnTy
 export async function handleEarlyTokenForAutoTrade(token: EarlyDiscoveredToken): Promise<void> {
   const traders = await listAutoTradeConfigs();
   for (const trader of traders) await openForUser(token, trader);
+}
+
+export async function manualBuyForUser(tokenAddress: string, telegramId: number): Promise<Awaited<ReturnType<typeof executeJupiterSwap>>> {
+  const trader = await getTraderConfig(telegramId);
+  const token: EarlyDiscoveredToken = {
+    address: tokenAddress,
+    progress: 0,
+    tokenCreatedAt: new Date(),
+    rawData: {}
+  };
+  const result = await openForUser(token, trader, true);
+  if (!result) throw new Error("Manual BUY tidak menghasilkan transaksi");
+  return result;
 }
 
 async function sellPosition(position: Awaited<ReturnType<typeof listOpenTradePositions>>[number], trader: Awaited<ReturnType<typeof listAutoTradeConfigs>>[number], user: NonNullable<Awaited<ReturnType<typeof getTelegramUser>>> , amountTokens: number, stage: 1 | 2): Promise<void> {

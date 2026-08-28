@@ -2,6 +2,7 @@ import { Bot, Context, InlineKeyboard, Keyboard } from "grammy";
 import { config } from "./config.js";
 import { getTelegramUser, getTraderConfig, hasNextEarlyPage, hasNextPage, hasNextUnboundedPage, listChatIds, listEarlyTokens, listOpenTradePositions, listTokens, listTopMentions, listUnboundedTokens, registerChat, registerTelegramUser, updateTraderConfig } from "./repository.js";
 import { getSolBalance, sendSol } from "./wallet.js";
+import { formatAutoTradeError, manualBuyForUser } from "./autotrade.js";
 import type { EarlyTokenListItem, TokenListItem, UnboundedTokenListItem } from "./types.js";
 
 const bot = new Bot(config.TELEGRAM_BOT_TOKEN);
@@ -281,6 +282,22 @@ bot.command("wallet", (ctx) => replyWalletMenu(ctx));
 bot.command("configtrade", (ctx) => replyTraderConfig(ctx));
 bot.command("early", (ctx) => sendEarlyList(ctx, 1));
 bot.command("tradepositions", (ctx) => sendOpenTradePositions(ctx));
+bot.command("buy", async (ctx) => {
+  if (!ctx.from) throw new Error("Telegram user tidak tersedia");
+  const tokenAddress = ctx.match.trim();
+  if (!tokenAddress) {
+    await ctx.reply("Format: /buy contract-address", { reply_markup: menuKeyboard });
+    return;
+  }
+  try {
+    const result = await manualBuyForUser(tokenAddress, ctx.from.id);
+    const mode = result.dryRun ? "DRY-RUN" : "BUY";
+    const reference = result.signature ?? result.requestId ?? "tanpa signature";
+    await ctx.reply(`Manual ${mode} berhasil\nToken: <code>${escapeHtml(tokenAddress)}</code>\nReferensi: <code>${escapeHtml(reference)}</code>`, { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: menuKeyboard });
+  } catch (error) {
+    await ctx.reply(`Manual BUY gagal: ${escapeHtml(formatAutoTradeError(error))}`, { parse_mode: "HTML", reply_markup: menuKeyboard });
+  }
+});
 bot.on("message:text", async (ctx, next) => {
   if (ctx.from && pendingWalletSend.has(ctx.from.id)) {
     const parts = ctx.message.text.trim().split(/\s+/);

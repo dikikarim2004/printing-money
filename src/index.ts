@@ -106,7 +106,8 @@ await bot.api.setMyCommands([
   { command: "early", description: "Early Token" },
   { command: "wallet", description: "Wallet SOL" },
   { command: "configtrade", description: "Konfigurasi auto-trade" },
-  { command: "tradepositions", description: "Open trade positions" }
+  { command: "tradepositions", description: "Open trade positions" },
+  { command: "buy", description: "Manual buy token" }
 ]);
 await bot.api.setChatMenuButton({ menu_button: { type: "commands" } });
 void bot.start({ onStart: () => console.log("Telegram bot started") }).catch((error) => {

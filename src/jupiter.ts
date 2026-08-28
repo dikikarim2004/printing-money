@@ -38,15 +38,15 @@ export async function getJupiterOrder(inputMint: string, outputMint: string, amo
   });
   const response = await fetch(`${config.JUPITER_SWAP_V2_API}/quote?${params}`, { headers: jupiterHeaders(), signal: AbortSignal.timeout(10000) });
   const quote = await readJsonResponse(response) as Record<string, unknown> & { error?: string; message?: string };
-  if (!response.ok) throw new Error(`Jupiter quote failed (${response.status}): ${quote.error ?? quote.message ?? "unknown error"}`);
+  if (!response.ok) throw new Error(`Jupiter quote failed (${response.status}): ${String(quote.error ?? quote.message ?? "unknown error")}`);
   const swapResponse = await fetch(`${config.JUPITER_SWAP_V2_API}/swap`, {
     method: "POST",
     headers: { ...jupiterHeaders(), "content-type": "application/json" },
-    body: JSON.stringify({ quoteResponse: quote, taker, feeAccount: config.JUPITER_REFERRAL_ACCOUNT, dynamicComputeUnitLimit: true, prioritizationFeeLamports: "auto" }),
+    body: JSON.stringify({ quoteResponse: quote, taker, userPublicKey: taker, feeAccount: config.JUPITER_REFERRAL_ACCOUNT, dynamicComputeUnitLimit: true, prioritizationFeeLamports: "auto" }),
     signal: AbortSignal.timeout(15000)
   });
   const built = await readJsonResponse(swapResponse) as { swapTransaction?: string; error?: string; message?: string };
-  if (!swapResponse.ok || !built.swapTransaction) throw new Error(`Jupiter swap build failed (${swapResponse.status}): ${built.error ?? built.message ?? "unknown error"}`);
+  if (!swapResponse.ok || !built.swapTransaction) throw new Error(`Jupiter swap build failed (${swapResponse.status}): ${String(built.error ?? built.message ?? "unknown error")}`);
   return { transaction: built.swapTransaction, inputAmount: String(quote.inAmount ?? amountBaseUnits), outputAmount: String(quote.outAmount ?? ""), feeBps: config.JUPITER_REFERRAL_FEE_BPS, feeMint: config.JUPITER_REFERRAL_ACCOUNT };
 }
 
