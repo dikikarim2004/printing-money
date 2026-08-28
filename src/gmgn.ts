@@ -4,16 +4,24 @@ import { config } from "./config.js";
 import type { DiscoveredToken, EarlyDiscoveredToken, UnboundedDiscoveredToken } from "./types.js";
 
 const execFileAsync = promisify(execFile);
+const GMGN_COMMAND_TIMEOUT_MS = 30_000;
+
+function runGmgn(args: string[]) {
+  return execFileAsync(config.GMGN_CLI_BIN, args, {
+    env: { ...process.env, ...(config.GMGN_API_KEY ? { GMGN_API_KEY: config.GMGN_API_KEY } : {}) },
+    timeout: GMGN_COMMAND_TIMEOUT_MS,
+    killSignal: "SIGTERM",
+    maxBuffer: 10 * 1024 * 1024
+  });
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : null;
 }
 
-// GMGN CLI `market trenches --raw` returns { new_creation: [...], near_completion: [...], completed: [...] },
 // not a generic data/tokens/list/rows/result envelope. near_completion progress is always < 1 (verified 0.49-0.92);
 // only completed holds tokens that reached 100% bonding curve progress (launchpad_status 1, complete_timestamp > 0).
-const ON_CURVE_CATEGORIES = ["completed"] as const;
-
+// GMGN `market trenches --raw` returns category arrays such as new_creation, near_completion, and completed.
 function recordsFromPayload(payload: unknown, categories: readonly string[]): Record<string, unknown>[] {
   if (Array.isArray(payload)) return payload.reduce<Record<string, unknown>[]>((records, item) => {
     const record = asRecord(item);
@@ -65,9 +73,22 @@ function parseDate(value: unknown): Date | null {
   return null;
 }
 
+function hasReachedAth(value: unknown): boolean {
+  if (typeof value === "number") return Number.isFinite(value) && value > 0;
+  if (typeof value === "string" && value.trim()) {
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) && numericValue > 0;
+  }
+  return false;
+}
+
 // GMGN's chain slugs (sol, eth, bsc, base) differ from DexScreener's chainId slugs; only "sol" -> "solana"
 // is verified against this app's actual GMGN_CHAIN config, others pass through best-effort.
 const DEXSCREENER_CHAIN_IDS: Record<string, string> = { sol: "solana", eth: "ethereum", bsc: "bsc", base: "base" };
+const splitFilterValues = (value: string): string[] => value.split(",").map((item) => item.trim()).filter(Boolean);
+const ON_CURVE_CATEGORIES = splitFilterValues(config.GMGN_COMPLETED_TYPES);
+const UNBOUNDED_CATEGORIES = splitFilterValues(config.GMGN_UNBOUNDED_TYPES);
+const EARLY_CATEGORIES = splitFilterValues(config.GMGN_EARLY_TYPES);
 
 type DexScreenerOrder = { type?: unknown; status?: unknown };
 type DexScreenerOrdersResponse = { orders?: DexScreenerOrder[] };
@@ -115,10 +136,7 @@ async function mapSequentialWithDelay<T, R>(items: T[], delayMs: number, fn: (it
 export async function fetchAthMarketCap(chain: string, address: string, totalSupply?: number): Promise<number | undefined> {
   if (!totalSupply) return undefined;
   try {
-    const { stdout } = await execFileAsync(config.GMGN_CLI_BIN, ["token", "info", "--chain", chain, "--address", address, "--raw"], {
-      env: { ...process.env, ...(config.GMGN_API_KEY ? { GMGN_API_KEY: config.GMGN_API_KEY } : {}) },
-      maxBuffer: 10 * 1024 * 1024
-    });
+    const { stdout } = await runGmgn(["token", "info", "--chain", chain, "--address", address, "--raw"]);
     const payload = JSON.parse(stdout) as Record<string, unknown>;
     const athPrice = payload.ath_price;
     if (typeof athPrice !== "number") return undefined;
@@ -137,13 +155,13 @@ function normalizeToken(record: Record<string, unknown>): DiscoveredToken | null
   const reachedFullBondingCurve = record.launchpad_status === 1 && typeof completeTimestamp === "number" && completeTimestamp > 0;
   const bondingValue = reachedFullBondingCurve ? completeTimestamp : (record.created_timestamp ?? record.bonding_at ?? record.bondingAt ?? record.bonding_curve_at ?? record.created_at ?? record.createdAt);
   const bondingAt = parseDate(bondingValue);
-  const withinLast24Hours = bondingAt !== null && Date.now() - bondingAt.getTime() <= 24 * 60 * 60 * 1000;
+  const withinBondingAge = bondingAt !== null && Date.now() - bondingAt.getTime() <= config.GMGN_COMPLETED_MAX_BONDING_AGE_HOURS * 60 * 60 * 1000;
   // Token age gate: `created_timestamp` is when the token contract itself was created; must be <= 1 hour old.
   const tokenCreatedAt = parseDate(record.created_timestamp);
-  const isYoungEnough = tokenCreatedAt !== null && Date.now() - tokenCreatedAt.getTime() <= 60 * 60 * 1000;
+  const isYoungEnough = tokenCreatedAt !== null && Date.now() - tokenCreatedAt.getTime() <= config.GMGN_COMPLETED_MAX_TOKEN_AGE_HOURS * 60 * 60 * 1000;
   // Dex-paid status is now verified live via DexScreener's /orders/v1 endpoint (see discoverBondingCurveTokens),
   // not GMGN's own dexscr_update_link field.
-  const isOnCurve = reachedFullBondingCurve && withinLast24Hours && isYoungEnough;
+  const isOnCurve = reachedFullBondingCurve && withinBondingAge && isYoungEnough;
   if (!address || !bondingAt || !tokenCreatedAt || !isOnCurve) return null;
 
   return {
@@ -170,11 +188,8 @@ export type DiscoveryResult<T> = { tokens: T[]; reliable: boolean };
 export async function discoverBondingCurveTokens(): Promise<DiscoveryResult<DiscoveredToken>> {
   // --max-bundler-rate 0.2 is GMGN's native filter for developer/bundler-held supply <= 20%,
   // confirmed empirically to constrain the bundler_trader_amount_rate field.
-  const args = ["market", "trenches", "--chain", config.GMGN_CHAIN, "--type", ...ON_CURVE_CATEGORIES, "--launchpad-platform", config.GMGN_LAUNCHPAD, "--limit", "80", "--max-bundler-rate", "0.2", "--raw"];
-  const { stdout } = await execFileAsync(config.GMGN_CLI_BIN, args, {
-    env: { ...process.env, ...(config.GMGN_API_KEY ? { GMGN_API_KEY: config.GMGN_API_KEY } : {}) },
-    maxBuffer: 10 * 1024 * 1024
-  });
+  const args = ["market", "trenches", "--chain", config.GMGN_CHAIN, "--type", ...ON_CURVE_CATEGORIES, "--launchpad-platform", config.GMGN_LAUNCHPAD, "--limit", String(config.GMGN_COMPLETED_LIMIT), "--max-bundler-rate", String(config.GMGN_COMPLETED_MAX_BUNDLER_RATE), "--raw"];
+  const { stdout } = await runGmgn(args);
   let payload: unknown;
   try {
     payload = JSON.parse(stdout);
@@ -182,7 +197,7 @@ export async function discoverBondingCurveTokens(): Promise<DiscoveryResult<Disc
     throw new Error("GMGN CLI returned non-JSON output");
   }
   const candidates = recordsFromPayload(payload, ON_CURVE_CATEGORIES).map(normalizeToken).filter((token): token is DiscoveredToken => token !== null);
-  const dexPaidChecks = await mapSequentialWithDelay(candidates, 1100, (token) => isDexScreenerPaid(config.GMGN_CHAIN, token.address));
+  const dexPaidChecks = await mapSequentialWithDelay(candidates, config.GMGN_DEXSCREENER_REQUEST_DELAY_MS, (token) => isDexScreenerPaid(config.GMGN_CHAIN, token.address));
   const tokens = candidates.filter((_, index) => dexPaidChecks[index].paid && dexPaidChecks[index].checked);
   // "reliable" means every DexScreener check actually completed; a caller must not use an unreliable
   // (rate-limited/failed) result set to prune previously-stored, still-valid data.
@@ -193,8 +208,6 @@ export async function discoverBondingCurveTokens(): Promise<DiscoveryResult<Disc
 // "Good Unbounded Token": bonding curve can be at ANY stage (early/new_creation included, not just near
 // completion - verified new_creation records use the same launchpad_status=0/complete_timestamp=0 schema),
 // but already dex paid + bundler <= 20% + organic + low rug risk + volume >= 50000.
-const UNBOUNDED_CATEGORIES = ["new_creation", "near_completion"] as const;
-
 function normalizeUnboundedToken(record: Record<string, unknown>): UnboundedDiscoveredToken | null {
   const address = firstString(record, ["address", "token_address", "tokenAddress", "ca"]);
   const completeTimestamp = record.complete_timestamp;
@@ -205,7 +218,7 @@ function normalizeUnboundedToken(record: Record<string, unknown>): UnboundedDisc
   const isOrganic = record.is_wash_trading === false;
   // Token age gate: `created_timestamp` is when the token contract itself was created; must be <= 1 hour old.
   const tokenCreatedAt = parseDate(record.created_timestamp);
-  const isYoungEnough = tokenCreatedAt !== null && Date.now() - tokenCreatedAt.getTime() <= 60 * 60 * 1000;
+  const isYoungEnough = tokenCreatedAt !== null && Date.now() - tokenCreatedAt.getTime() <= config.GMGN_UNBOUNDED_MAX_TOKEN_AGE_HOURS * 60 * 60 * 1000;
   if (!address || !notYetCompleted || !isOrganic || !tokenCreatedAt || !isYoungEnough) return null;
   const progress = typeof record.progress === "number" ? record.progress : 0;
   const rugRatio = typeof record.rug_ratio === "number" ? record.rug_ratio : undefined;
@@ -231,11 +244,8 @@ function normalizeUnboundedToken(record: Record<string, unknown>): UnboundedDisc
 export async function discoverUnboundedTokens(): Promise<DiscoveryResult<UnboundedDiscoveredToken>> {
   // --max-rug-ratio 0.3 is the CLI's own documented example threshold for excluding rug-pull risk.
   // --min-volume-24h 50000 is the user-specified hard volume floor for a "Good Unbounded Token".
-  const args = ["market", "trenches", "--chain", config.GMGN_CHAIN, "--type", ...UNBOUNDED_CATEGORIES, "--launchpad-platform", config.GMGN_LAUNCHPAD, "--limit", "80", "--max-bundler-rate", "0.2", "--max-rug-ratio", "0.3", "--min-volume-24h", "20000", "--raw"];
-  const { stdout } = await execFileAsync(config.GMGN_CLI_BIN, args, {
-    env: { ...process.env, ...(config.GMGN_API_KEY ? { GMGN_API_KEY: config.GMGN_API_KEY } : {}) },
-    maxBuffer: 10 * 1024 * 1024
-  });
+  const args = ["market", "trenches", "--chain", config.GMGN_CHAIN, "--type", ...UNBOUNDED_CATEGORIES, "--launchpad-platform", config.GMGN_LAUNCHPAD, "--limit", String(config.GMGN_UNBOUNDED_LIMIT), "--max-bundler-rate", String(config.GMGN_UNBOUNDED_MAX_BUNDLER_RATE), "--max-rug-ratio", String(config.GMGN_UNBOUNDED_MAX_RUG_RATIO), "--min-volume-24h", String(config.GMGN_UNBOUNDED_MIN_VOLUME_24H), "--raw"];
+  const { stdout } = await runGmgn(args);
   let payload: unknown;
   try {
     payload = JSON.parse(stdout);
@@ -243,18 +253,15 @@ export async function discoverUnboundedTokens(): Promise<DiscoveryResult<Unbound
     throw new Error("GMGN CLI returned non-JSON output");
   }
   const candidates = recordsFromPayload(payload, UNBOUNDED_CATEGORIES).map(normalizeUnboundedToken).filter((token): token is UnboundedDiscoveredToken => token !== null);
-  const dexPaidChecks = await mapSequentialWithDelay(candidates, 1100, (token) => isDexScreenerPaid(config.GMGN_CHAIN, token.address));
+  const dexPaidChecks = await mapSequentialWithDelay(candidates, config.GMGN_DEXSCREENER_REQUEST_DELAY_MS, (token) => isDexScreenerPaid(config.GMGN_CHAIN, token.address));
   const tokens = candidates.filter((_, index) => dexPaidChecks[index].paid && dexPaidChecks[index].checked);
   const reliable = dexPaidChecks.every((check) => check.checked);
   return { tokens, reliable };
 }
 
 export async function discoverEarlyTokens(): Promise<EarlyDiscoveredToken[]> {
-  const args = ["market", "trenches", "--chain", config.GMGN_CHAIN, "--type", "new_creation", "--launchpad-platform", config.GMGN_LAUNCHPAD, "--limit", "80", "--raw"];
-  const { stdout } = await execFileAsync(config.GMGN_CLI_BIN, args, {
-    env: { ...process.env, ...(config.GMGN_API_KEY ? { GMGN_API_KEY: config.GMGN_API_KEY } : {}) },
-    maxBuffer: 10 * 1024 * 1024
-  });
+  const args = ["market", "trenches", "--chain", config.GMGN_CHAIN, "--type", ...EARLY_CATEGORIES, "--launchpad-platform", config.GMGN_LAUNCHPAD, "--limit", String(config.GMGN_EARLY_LIMIT), "--raw"];
+  const { stdout } = await runGmgn(args);
   let payload: unknown;
   try {
     payload = JSON.parse(stdout);
@@ -262,7 +269,14 @@ export async function discoverEarlyTokens(): Promise<EarlyDiscoveredToken[]> {
     throw new Error("GMGN CLI returned non-JSON output");
   }
   return recordsFromPayload(payload, ["new_creation"])
-    .filter((record) => typeof record.market_cap === "number" && record.market_cap >= 2000 && record.market_cap < 3000 && typeof record.ath_price !== "number" && typeof record.volume_24h === "number" && record.volume_24h >= 20000)
+    .filter((record) => {
+      const tokenCreatedAt = parseDate(record.created_timestamp);
+      const tokenAgeMs = tokenCreatedAt ? Date.now() - tokenCreatedAt.getTime() : -1;
+      return tokenAgeMs >= 0 && tokenAgeMs <= config.GMGN_EARLY_MAX_TOKEN_AGE_MINUTES * 60 * 1000
+        && typeof record.market_cap === "number" && record.market_cap >= config.GMGN_EARLY_MIN_MARKET_CAP && record.market_cap < config.GMGN_EARLY_MAX_MARKET_CAP
+        && !hasReachedAth(record.ath_price)
+        && typeof record.volume_24h === "number" && record.volume_24h >= config.GMGN_EARLY_MIN_VOLUME_24H;
+    })
     .map(normalizeEarlyToken)
     .filter((token): token is EarlyDiscoveredToken => token !== null);
 }

@@ -1,7 +1,7 @@
 import { Keypair, VersionedTransaction } from "@solana/web3.js";
 import { config } from "./config.js";
+import { solanaConnection } from "./wallet.js";
 
-const JUPITER_ULTRA_URL = "https://api.jup.ag/ultra/v1";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 type JupiterOrder = {
@@ -19,39 +19,48 @@ function jupiterHeaders(): HeadersInit {
   return { accept: "application/json", "x-api-key": config.JUPITER_API_KEY };
 }
 
+async function readJsonResponse(response: Response): Promise<Record<string, unknown>> {
+  const body = await response.text();
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed !== null && typeof parsed === "object") return parsed as Record<string, unknown>;
+  } catch {}
+  throw new Error(`Jupiter returned non-JSON response (${response.status}): ${body.slice(0, 200)}`);
+}
+
 export async function getJupiterOrder(inputMint: string, outputMint: string, amountBaseUnits: bigint, taker: string): Promise<JupiterOrder> {
   const params = new URLSearchParams({
     inputMint,
     outputMint,
     amount: amountBaseUnits.toString(),
-    taker,
-    referralAccount: config.JUPITER_REFERRAL_ACCOUNT,
-    referralFee: String(config.JUPITER_REFERRAL_FEE_BPS)
+    slippageBps: "100",
+    platformFeeBps: String(config.JUPITER_REFERRAL_FEE_BPS)
   });
-  const response = await fetch(`${JUPITER_ULTRA_URL}/order?${params}`, { headers: jupiterHeaders(), signal: AbortSignal.timeout(10000) });
-  const body = await response.json() as JupiterOrder & { error?: string; message?: string };
-  if (!response.ok) throw new Error(`Jupiter order failed (${response.status}): ${body.error ?? body.message ?? "unknown error"}`);
-  if (body.feeBps !== undefined && body.feeBps !== config.JUPITER_REFERRAL_FEE_BPS) throw new Error(`Jupiter returned feeBps=${body.feeBps}, expected ${config.JUPITER_REFERRAL_FEE_BPS}`);
-  return body;
+  const response = await fetch(`${config.JUPITER_SWAP_V2_API}/quote?${params}`, { headers: jupiterHeaders(), signal: AbortSignal.timeout(10000) });
+  const quote = await readJsonResponse(response) as Record<string, unknown> & { error?: string; message?: string };
+  if (!response.ok) throw new Error(`Jupiter quote failed (${response.status}): ${quote.error ?? quote.message ?? "unknown error"}`);
+  const swapResponse = await fetch(`${config.JUPITER_SWAP_V2_API}/swap`, {
+    method: "POST",
+    headers: { ...jupiterHeaders(), "content-type": "application/json" },
+    body: JSON.stringify({ quoteResponse: quote, taker, feeAccount: config.JUPITER_REFERRAL_ACCOUNT, dynamicComputeUnitLimit: true, prioritizationFeeLamports: "auto" }),
+    signal: AbortSignal.timeout(15000)
+  });
+  const built = await readJsonResponse(swapResponse) as { swapTransaction?: string; error?: string; message?: string };
+  if (!swapResponse.ok || !built.swapTransaction) throw new Error(`Jupiter swap build failed (${swapResponse.status}): ${built.error ?? built.message ?? "unknown error"}`);
+  return { transaction: built.swapTransaction, inputAmount: String(quote.inAmount ?? amountBaseUnits), outputAmount: String(quote.outAmount ?? ""), feeBps: config.JUPITER_REFERRAL_FEE_BPS, feeMint: config.JUPITER_REFERRAL_ACCOUNT };
 }
 
 export async function executeJupiterSwap(encryptedPrivateKey: string, inputMint: string, outputMint: string, amountBaseUnits: bigint, dryRun: boolean): Promise<{ dryRun: boolean; requestId?: string; signature?: string; order: JupiterOrder }> {
   const wallet = Keypair.fromSecretKey(await decryptForSwap(encryptedPrivateKey));
   const order = await getJupiterOrder(inputMint, outputMint, amountBaseUnits, wallet.publicKey.toBase58());
   if (dryRun) return { dryRun: true, requestId: order.requestId, order };
-  if (!order.transaction || !order.requestId) throw new Error("Jupiter returned no executable transaction");
-  const transaction = VersionedTransaction.deserialize(Buffer.from(order.transaction, "base64"));
+  if (!order.transaction) throw new Error("Jupiter returned no executable transaction");
+  const transactionBytes = Uint8Array.from(atob(order.transaction), (character) => character.charCodeAt(0));
+  const transaction = VersionedTransaction.deserialize(transactionBytes);
   transaction.sign([wallet]);
-  const signedTransaction = Buffer.from(transaction.serialize()).toString("base64");
-  const response = await fetch(`${JUPITER_ULTRA_URL}/execute`, {
-    method: "POST",
-    headers: { ...jupiterHeaders(), "content-type": "application/json" },
-    body: JSON.stringify({ signedTransaction, requestId: order.requestId }),
-    signal: AbortSignal.timeout(30000)
-  });
-  const body = await response.json() as { status?: string; signature?: string; error?: string; message?: string };
-  if (!response.ok || body.status !== "Success") throw new Error(`Jupiter execute failed (${response.status}): ${body.error ?? body.message ?? body.status ?? "unknown error"}`);
-  return { dryRun: false, requestId: order.requestId, signature: body.signature, order };
+  const signature = await solanaConnection.sendRawTransaction(transaction.serialize(), { skipPreflight: false, maxRetries: 3 });
+  await solanaConnection.confirmTransaction(signature, "confirmed");
+  return { dryRun: false, signature, order };
 }
 
 export async function getTokenPriceInSol(tokenMint: string): Promise<number> {

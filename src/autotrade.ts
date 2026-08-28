@@ -2,6 +2,7 @@ import type { EarlyDiscoveredToken } from "./types.js";
 import { executeJupiterSwap, getTokenPriceInSol, SOL_MINT } from "./jupiter.js";
 import { config } from "./config.js";
 import { createTradePosition, countOpenTradePositions, findOpenTradePosition, getTelegramUser, listAutoTradeConfigs, listOpenTradePositions, updateTradePosition } from "./repository.js";
+import { notifyAutoTradeFailure } from "./telegram.js";
 
 const SOL_DECIMALS = 9;
 const POSITION_POLL_MS = 2000;
@@ -21,6 +22,16 @@ function baseUnits(value: number, decimals: number): bigint {
 function orderAmount(order: { outputAmount?: string }): number {
   if (!order.outputAmount || !/^\d+$/.test(order.outputAmount)) throw new Error("Jupiter order has no valid outputAmount");
   return Number(order.outputAmount);
+}
+
+function formatAutoTradeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const details = error as Error & { signature?: unknown; transactionLogs?: unknown; logs?: unknown };
+  const lines = [error.message];
+  if (typeof details.signature === "string" && details.signature) lines.push(`Signature: ${details.signature}`);
+  const transactionLogs = Array.isArray(details.transactionLogs) ? details.transactionLogs : Array.isArray(details.logs) ? details.logs : [];
+  if (transactionLogs.length) lines.push(`Simulation logs:\n${transactionLogs.join("\n")}`);
+  return lines.join("\n");
 }
 
 async function openForUser(token: EarlyDiscoveredToken, trader: Awaited<ReturnType<typeof listAutoTradeConfigs>>[number]): Promise<void> {
@@ -53,6 +64,7 @@ async function openForUser(token: EarlyDiscoveredToken, trader: Awaited<ReturnTy
     console.log(`Auto-trade ${trader.statusDryRun ? "DRY-RUN" : "BUY"} | user=${telegramId} | token=${token.symbol ?? token.address} | amount=${trader.solAmountTradePerPosition} SOL`);
   } catch (error) {
     console.error(`Auto-trade BUY failed | user=${telegramId} | token=${token.address}:`, error);
+    await notifyAutoTradeFailure(telegramId, token.address, formatAutoTradeError(error));
   } finally {
     tokenLocks.delete(lockKey);
   }
@@ -105,7 +117,10 @@ async function pollOpenPositions(): Promise<void> {
       const positions = await listOpenTradePositions(Number(trader.telegramId));
       for (const position of positions) {
         try { await monitorPosition(position, trader, user); }
-        catch (error) { console.error(`Auto-trade monitor failed | user=${trader.telegramId} | position=${position.id}:`, error); }
+        catch (error) {
+          console.error(`Auto-trade monitor failed | user=${trader.telegramId} | position=${position.id}:`, error);
+          await notifyAutoTradeFailure(position.telegramId, position.tokenAddress, formatAutoTradeError(error));
+        }
       }
     }
   } finally {

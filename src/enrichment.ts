@@ -68,7 +68,8 @@ export async function enrichSocial(token: Pick<DiscoveredToken, "address" | "twi
       "content-type": "application/json",
       ...(config.X_ENRICHMENT_TOKEN ? { authorization: `Bearer ${config.X_ENRICHMENT_TOKEN}` } : {})
     },
-    body: JSON.stringify({ address: token.address, twitterUrl: token.twitterUrl })
+    body: JSON.stringify({ address: token.address, twitterUrl: token.twitterUrl }),
+    signal: AbortSignal.timeout(8000)
   });
   if (!response.ok) throw new Error(`X enrichment failed with HTTP ${response.status}`);
   const body = await response.json() as { twitterUrl?: unknown; xMentionCount?: unknown; mentionCount?: unknown };

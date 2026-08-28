@@ -443,7 +443,7 @@ export async function notifyNewUnboundedToken(token: UnboundedTokenListItem): Pr
 export async function notifyNewEarlyToken(token: EarlyTokenListItem): Promise<void> {
   const chatIds = await listChatIds();
   if (!chatIds.length) return;
-  const header = escapeHtml("Early token terdeteksi (MCAP 2.000-<3.000 USD, belum ada ATH, volume >= 20.000 USD, X mentions >= 1)!");
+  const header = escapeHtml(`Early token terdeteksi (MCAP 2.000-<3.000 USD, belum ada ATH, volume >= 20.000 USD, X mentions >= ${config.GMGN_EARLY_MIN_X_MENTIONS})!`);
   const message = `${header}\n\n${renderEarlyTokenRow(token, new Date())}`;
   for (const chatId of chatIds) {
     try {
@@ -451,6 +451,15 @@ export async function notifyNewEarlyToken(token: EarlyTokenListItem): Promise<vo
     } catch (error) {
       console.error(`Gagal mengirim notifikasi early token ke chat ${chatId}:`, error);
     }
+  }
+}
+
+export async function notifyAutoTradeFailure(telegramId: bigint, tokenAddress: string, error: unknown): Promise<void> {
+  const detail = error instanceof Error ? error.message : String(error);
+  try {
+    await bot.api.sendMessage(telegramId.toString(), `Auto-trade gagal\nTelegram ID: ${telegramId}\nToken: ${escapeHtml(tokenAddress)}\nError: ${escapeHtml(detail)}`, { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: menuKeyboard });
+  } catch (notificationError) {
+    console.error(`Gagal mengirim notifikasi auto-trade ke Telegram ID ${telegramId}:`, notificationError);
   }
 }
 
