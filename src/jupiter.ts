@@ -1,4 +1,4 @@
-import { Keypair, VersionedTransaction } from "@solana/web3.js";
+import { Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { config } from "./config.js";
 import { solanaConnection } from "./wallet.js";
 
@@ -28,26 +28,49 @@ async function readJsonResponse(response: Response): Promise<Record<string, unkn
   throw new Error(`Jupiter returned non-JSON response (${response.status}): ${body.slice(0, 200)}`);
 }
 
+async function referralSolTokenAccount(): Promise<string> {
+  const accounts = await Promise.race([
+    solanaConnection.getParsedTokenAccountsByOwner(new PublicKey(config.JUPITER_REFERRAL_ACCOUNT), { mint: new PublicKey(SOL_MINT) }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Jupiter referral SOL account lookup timed out")), 5000))
+  ]);
+  const account = accounts.value.find((item) => {
+    const info = item.account.data.parsed.info as { mint?: string; isNative?: boolean };
+    return info.mint === SOL_MINT && info.isNative === true;
+  });
+  if (!account) throw new Error("Jupiter referral SOL token account was not found");
+  return account.pubkey.toBase58();
+}
+
 export async function getJupiterOrder(inputMint: string, outputMint: string, amountBaseUnits: bigint, taker: string): Promise<JupiterOrder> {
+  const isSellToSol = outputMint === SOL_MINT;
   const params = new URLSearchParams({
     inputMint,
     outputMint,
     amount: amountBaseUnits.toString(),
     slippageBps: "100",
-    platformFeeBps: String(config.JUPITER_REFERRAL_FEE_BPS)
+    instructionVersion: "V2"
   });
+  if (isSellToSol) params.set("platformFeeBps", String(config.JUPITER_REFERRAL_FEE_BPS));
   const response = await fetch(`${config.JUPITER_SWAP_V2_API}/quote?${params}`, { headers: jupiterHeaders(), signal: AbortSignal.timeout(10000) });
   const quote = await readJsonResponse(response) as Record<string, unknown> & { error?: string; message?: string };
   if (!response.ok) throw new Error(`Jupiter quote failed (${response.status}): ${String(quote.error ?? quote.message ?? "unknown error")}`);
   const swapResponse = await fetch(`${config.JUPITER_SWAP_V2_API}/swap`, {
     method: "POST",
     headers: { ...jupiterHeaders(), "content-type": "application/json" },
-    body: JSON.stringify({ quoteResponse: quote, taker, userPublicKey: taker, feeAccount: config.JUPITER_REFERRAL_ACCOUNT, dynamicComputeUnitLimit: true, prioritizationFeeLamports: "auto" }),
+    body: JSON.stringify({
+      quoteResponse: quote,
+      taker,
+      userPublicKey: taker,
+      instructionVersion: "V2",
+      ...(isSellToSol ? { feeAccount: await referralSolTokenAccount() } : {}),
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: "auto"
+    }),
     signal: AbortSignal.timeout(15000)
   });
   const built = await readJsonResponse(swapResponse) as { swapTransaction?: string; error?: string; message?: string };
   if (!swapResponse.ok || !built.swapTransaction) throw new Error(`Jupiter swap build failed (${swapResponse.status}): ${String(built.error ?? built.message ?? "unknown error")}`);
-  return { transaction: built.swapTransaction, inputAmount: String(quote.inAmount ?? amountBaseUnits), outputAmount: String(quote.outAmount ?? ""), feeBps: config.JUPITER_REFERRAL_FEE_BPS, feeMint: config.JUPITER_REFERRAL_ACCOUNT };
+  return { transaction: built.swapTransaction, inputAmount: String(quote.inAmount ?? amountBaseUnits), outputAmount: String(quote.outAmount ?? ""), feeBps: isSellToSol ? config.JUPITER_REFERRAL_FEE_BPS : 0, feeMint: isSellToSol ? config.JUPITER_REFERRAL_ACCOUNT : undefined };
 }
 
 export async function executeJupiterSwap(encryptedPrivateKey: string, inputMint: string, outputMint: string, amountBaseUnits: bigint, dryRun: boolean): Promise<{ dryRun: boolean; requestId?: string; signature?: string; order: JupiterOrder }> {

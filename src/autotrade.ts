@@ -1,12 +1,16 @@
 import type { EarlyDiscoveredToken } from "./types.js";
 import { executeJupiterSwap, getTokenPriceInSol, SOL_MINT } from "./jupiter.js";
+import { PublicKey } from "@solana/web3.js";
 import { config } from "./config.js";
 import { createTradePosition, countOpenTradePositions, findOpenTradePosition, getTelegramUser, getTraderConfig, listAutoTradeConfigs, listOpenTradePositions, updateTradePosition } from "./repository.js";
 import { notifyAutoTradeFailure } from "./telegram.js";
+import { solanaConnection } from "./wallet.js";
 
 const SOL_DECIMALS = 9;
 const POSITION_POLL_MS = 2000;
 const tokenLocks = new Set<string>();
+const notifiedTradeFailures = new Set<string>();
+const blockedAutomaticSells = new Set<string>();
 let pollInProgress = false;
 
 function tokenDecimals(token: EarlyDiscoveredToken): number {
@@ -32,6 +36,25 @@ export function formatAutoTradeError(error: unknown): string {
   const transactionLogs = Array.isArray(details.transactionLogs) ? details.transactionLogs : Array.isArray(details.logs) ? details.logs : [];
   if (transactionLogs.length) lines.push(`Simulation logs:\n${transactionLogs.join("\n")}`);
   return lines.join("\n");
+}
+
+export function formatUserTradeError(operation: "BUY" | "SELL", error: unknown): string {
+  const detail = formatAutoTradeError(error);
+  if (/Posisi OPEN untuk token ini sudah ada/i.test(detail)) return `${operation} tidak dijalankan: posisi OPEN untuk token ini sudah ada.`;
+  if (/Maksimal posisi OPEN/i.test(detail)) return `${operation} tidak dijalankan: batas maksimal posisi OPEN sudah tercapai.`;
+  if (/insufficient lamports|insufficient funds|insufficient balance/i.test(detail)) return `${operation} gagal: saldo wallet tidak cukup untuk modal dan biaya transaksi.`;
+  if (/IncorrectProgramId|InvalidAccountData|invalid account data/i.test(detail)) return `${operation} gagal: rute token tidak kompatibel dengan Token-2022 pada Jupiter. Transaksi tidak dikonfirmasi.`;
+  if (/Jupiter quote failed|Failed to get quotes|no route|route not found/i.test(detail)) return `${operation} gagal: Jupiter tidak menemukan rute likuiditas untuk token tersebut.`;
+  if (/Jupiter swap build failed/i.test(detail)) return `${operation} gagal: Jupiter tidak dapat membangun transaksi.`;
+  if (/Simulation failed|simulation failed/i.test(detail)) return `${operation} gagal: transaksi ditolak saat simulasi blockchain. Tidak ada posisi yang diubah.`;
+  if (/timed out|timeout|fetch failed|network/i.test(detail)) return `${operation} gagal: layanan blockchain/Jupiter tidak merespons tepat waktu.`;
+  return `${operation} gagal: transaksi tidak berhasil diproses. Silakan hubungi operator.`;
+}
+
+async function notifyTradeFailureOnce(key: string, operation: "BUY" | "SELL", telegramId: bigint, tokenAddress: string, error: unknown): Promise<void> {
+  if (notifiedTradeFailures.has(key)) return;
+  notifiedTradeFailures.add(key);
+  await notifyAutoTradeFailure(telegramId, operation, tokenAddress, formatUserTradeError(operation, error));
 }
 
 async function openForUser(token: EarlyDiscoveredToken, trader: Awaited<ReturnType<typeof listAutoTradeConfigs>>[number], throwOnFailure = false): Promise<Awaited<ReturnType<typeof executeJupiterSwap>> | undefined> {
@@ -71,7 +94,7 @@ async function openForUser(token: EarlyDiscoveredToken, trader: Awaited<ReturnTy
     return buy;
   } catch (error) {
     console.error(`Auto-trade BUY failed | user=${telegramId} | token=${token.address}:`, error);
-    if (!throwOnFailure) await notifyAutoTradeFailure(telegramId, token.address, formatAutoTradeError(error));
+    if (!throwOnFailure) await notifyTradeFailureOnce(`BUY:${telegramId}:${token.address}`, "BUY", telegramId, token.address, error);
     if (throwOnFailure) throw error;
   } finally {
     tokenLocks.delete(lockKey);
@@ -97,6 +120,7 @@ export async function manualBuyForUser(tokenAddress: string, telegramId: number)
 }
 
 async function sellPosition(position: Awaited<ReturnType<typeof listOpenTradePositions>>[number], trader: Awaited<ReturnType<typeof listAutoTradeConfigs>>[number], user: NonNullable<Awaited<ReturnType<typeof getTelegramUser>>> , amountTokens: number, stage: 1 | 2): Promise<void> {
+  if (!Number.isFinite(amountTokens) || amountTokens <= 0) throw new Error("Jumlah token untuk SELL tidak valid");
   const sell = await executeJupiterSwap(user.encryptedPrivateKey, position.tokenAddress, SOL_MINT, baseUnits(amountTokens, position.tokenDecimals), trader.statusDryRun);
   const proceeds = orderAmount(sell.order) / 10 ** SOL_DECIMALS;
   const txHash = sell.signature ?? (sell.requestId ? `DRY_RUN:${sell.requestId}` : undefined);
@@ -108,6 +132,43 @@ async function sellPosition(position: Awaited<ReturnType<typeof listOpenTradePos
   console.log(`Auto-trade ${trader.statusDryRun ? "DRY-RUN" : "SELL"} TP${stage} | user=${position.telegramId} | token=${position.tokenAddress} | proceeds=${proceeds} SOL`);
 }
 
+async function attemptAutomaticSell(position: Awaited<ReturnType<typeof listOpenTradePositions>>[number], trader: Awaited<ReturnType<typeof listAutoTradeConfigs>>[number], user: NonNullable<Awaited<ReturnType<typeof getTelegramUser>>>, amountTokens: number, stage: 1 | 2): Promise<void> {
+  if (blockedAutomaticSells.has(position.id)) return;
+  try {
+    await sellPosition(position, trader, user, amountTokens, stage);
+  } catch (error) {
+    blockedAutomaticSells.add(position.id);
+    throw error;
+  }
+}
+
+export async function manualSellForUser(tokenAddress: string, telegramId: number): Promise<Awaited<ReturnType<typeof executeJupiterSwap>>> {
+  const user = await getTelegramUser(telegramId);
+  if (!user) throw new Error("Wallet user belum terdaftar");
+  const positions = (await listOpenTradePositions(telegramId)).filter((position) => position.tokenAddress === tokenAddress);
+  if (!positions.length) throw new Error("Tidak ada posisi OPEN untuk contract address tersebut");
+  const mint = new PublicKey(tokenAddress);
+  const accounts = await solanaConnection.getParsedTokenAccountsByOwner(new PublicKey(user.walletAddress), { mint });
+  const balance = accounts.value.reduce((total, account) => {
+    const info = account.account.data.parsed.info as { tokenAmount?: { amount?: string; decimals?: number } };
+    return total + BigInt(info.tokenAmount?.amount ?? "0");
+  }, 0n);
+  if (balance <= 0n) throw new Error("Saldo memecoin pada wallet adalah 0");
+  const decimals = accounts.value[0]?.account.data.parsed.info.tokenAmount.decimals;
+  if (typeof decimals !== "number") throw new Error("Decimal token tidak tersedia");
+  const trader = await getTraderConfig(telegramId);
+  const sell = await executeJupiterSwap(user.encryptedPrivateKey, tokenAddress, SOL_MINT, balance, trader.statusDryRun);
+  const proceeds = orderAmount(sell.order) / 10 ** SOL_DECIMALS;
+  const txHash = sell.signature ?? (sell.requestId ? `DRY_RUN:${sell.requestId}` : undefined);
+  if (!trader.statusDryRun) {
+    for (const position of positions) {
+      await updateTradePosition(position.id, { tokenAmount: 0, takeProfit2Sol: proceeds, takeProfit2Executed: true, takeProfit2TxHash: txHash, lastPriceAt: new Date(), status: "CLOSE" });
+    }
+  }
+  console.log(`Manual SELL ${trader.statusDryRun ? "DRY-RUN" : "SUCCESS"} | user=${telegramId} | token=${tokenAddress} | amountBaseUnits=${balance.toString()}`);
+  return sell;
+}
+
 async function monitorPosition(position: Awaited<ReturnType<typeof listOpenTradePositions>>[number], trader: Awaited<ReturnType<typeof listAutoTradeConfigs>>[number], user: NonNullable<Awaited<ReturnType<typeof getTelegramUser>>>): Promise<void> {
   const price = await getTokenPriceInSol(position.tokenAddress);
   const currentValue = position.tokenAmount * price;
@@ -116,14 +177,14 @@ async function monitorPosition(position: Awaited<ReturnType<typeof listOpenTrade
     const targetSol = position.amountSol * trader.takeProfit1TargetPercent / 100;
     if (currentValue >= targetSol) {
       const desiredProceeds = targetSol * trader.takeProfit1SellPercent / 100;
-      await sellPosition(position, trader, user, Math.min(position.tokenAmount, desiredProceeds / price), 1);
+      await attemptAutomaticSell(position, trader, user, Math.min(position.tokenAmount, desiredProceeds / price), 1);
     }
     return;
   }
   if (!position.takeProfit2Executed) {
     const totalTargetSol = position.amountSol * (1 + trader.takeProfit2TargetPercent / 100);
     const remainingTargetSol = Math.max(0, totalTargetSol - (position.takeProfit1Sol ?? 0));
-    if (currentValue >= remainingTargetSol) await sellPosition(position, trader, user, position.tokenAmount, 2);
+    if (currentValue >= remainingTargetSol) await attemptAutomaticSell(position, trader, user, position.tokenAmount, 2);
   }
 }
 
@@ -140,7 +201,7 @@ async function pollOpenPositions(): Promise<void> {
         try { await monitorPosition(position, trader, user); }
         catch (error) {
           console.error(`Auto-trade monitor failed | user=${trader.telegramId} | position=${position.id}:`, error);
-          await notifyAutoTradeFailure(position.telegramId, position.tokenAddress, formatAutoTradeError(error));
+          await notifyTradeFailureOnce(`SELL:${position.telegramId}:${position.id}`, "SELL", position.telegramId, position.tokenAddress, error);
         }
       }
     }

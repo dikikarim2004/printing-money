@@ -2,7 +2,7 @@ import { Bot, Context, InlineKeyboard, Keyboard } from "grammy";
 import { config } from "./config.js";
 import { getTelegramUser, getTraderConfig, hasNextEarlyPage, hasNextPage, hasNextUnboundedPage, listChatIds, listEarlyTokens, listOpenTradePositions, listTokens, listTopMentions, listUnboundedTokens, registerChat, registerTelegramUser, updateTraderConfig } from "./repository.js";
 import { getSolBalance, sendSol } from "./wallet.js";
-import { formatAutoTradeError, manualBuyForUser } from "./autotrade.js";
+import { formatUserTradeError, manualBuyForUser, manualSellForUser } from "./autotrade.js";
 import type { EarlyTokenListItem, TokenListItem, UnboundedTokenListItem } from "./types.js";
 
 const bot = new Bot(config.TELEGRAM_BOT_TOKEN);
@@ -295,7 +295,24 @@ bot.command("buy", async (ctx) => {
     const reference = result.signature ?? result.requestId ?? "tanpa signature";
     await ctx.reply(`Manual ${mode} berhasil\nToken: <code>${escapeHtml(tokenAddress)}</code>\nReferensi: <code>${escapeHtml(reference)}</code>`, { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: menuKeyboard });
   } catch (error) {
-    await ctx.reply(`Manual BUY gagal: ${escapeHtml(formatAutoTradeError(error))}`, { parse_mode: "HTML", reply_markup: menuKeyboard });
+    await ctx.reply(`Manual BUY gagal: ${escapeHtml(formatUserTradeError("BUY", error))}`, { parse_mode: "HTML", reply_markup: menuKeyboard });
+  }
+});
+bot.command("sell", async (ctx) => {
+  if (!ctx.from) throw new Error("Telegram user tidak tersedia");
+  const tokenAddress = ctx.match.trim();
+  if (!tokenAddress) {
+    await ctx.reply("Format: /sell contract-address", { reply_markup: menuKeyboard });
+    return;
+  }
+  try {
+    const result = await manualSellForUser(tokenAddress, ctx.from.id);
+    const mode = result.dryRun ? "DRY-RUN" : "SELL";
+    const reference = result.signature ?? result.requestId ?? "tanpa signature";
+    const positionStatus = result.dryRun ? "Status TradePosition tidak diubah karena mode dry-run." : "TradePosition terkait sudah ditandai CLOSE.";
+    await ctx.reply(`Manual ${mode} berhasil\nToken: <code>${escapeHtml(tokenAddress)}</code>\nReferensi: <code>${escapeHtml(reference)}</code>\n${positionStatus}`, { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: menuKeyboard });
+  } catch (error) {
+    await ctx.reply(`Manual SELL gagal: ${escapeHtml(formatUserTradeError("SELL", error))}`, { parse_mode: "HTML", reply_markup: menuKeyboard });
   }
 });
 bot.on("message:text", async (ctx, next) => {
@@ -446,7 +463,7 @@ export async function notifyNewToken(token: TokenListItem): Promise<void> {
 export async function notifyNewUnboundedToken(token: UnboundedTokenListItem): Promise<void> {
   const chatIds = await listChatIds();
   if (!chatIds.length) return;
-  const header = escapeHtml("Good Unbounded Token terdeteksi (bonding curve belum 100%, dex paid, bundler <= 20%, organik, rug risk rendah, volume >= 20000)!");
+  const header = escapeHtml(`Good Unbounded Token terdeteksi (bonding curve belum 100%, dex paid, bundler <= 20%, organik, rug risk rendah, volume >= ${config.GMGN_UNBOUNDED_MIN_VOLUME_24H.toLocaleString("id-ID")})!`);
   const message = `${header}\n\n${renderUnboundedTokenRow(token, new Date())}`;
   for (const chatId of chatIds) {
     try {
@@ -460,7 +477,7 @@ export async function notifyNewUnboundedToken(token: UnboundedTokenListItem): Pr
 export async function notifyNewEarlyToken(token: EarlyTokenListItem): Promise<void> {
   const chatIds = await listChatIds();
   if (!chatIds.length) return;
-  const header = escapeHtml(`Early token terdeteksi (MCAP 2.000-<3.000 USD, belum ada ATH, volume >= 20.000 USD, X mentions >= ${config.GMGN_EARLY_MIN_X_MENTIONS})!`);
+  const header = escapeHtml(`Early token terdeteksi (MCAP 2.000-<3.000 USD, belum ada ATH, volume >= ${config.GMGN_EARLY_MIN_VOLUME_24H.toLocaleString("id-ID")} USD, X mentions >= ${config.GMGN_EARLY_MIN_X_MENTIONS})!`);
   const message = `${header}\n\n${renderEarlyTokenRow(token, new Date())}`;
   for (const chatId of chatIds) {
     try {
@@ -471,10 +488,9 @@ export async function notifyNewEarlyToken(token: EarlyTokenListItem): Promise<vo
   }
 }
 
-export async function notifyAutoTradeFailure(telegramId: bigint, tokenAddress: string, error: unknown): Promise<void> {
-  const detail = error instanceof Error ? error.message : String(error);
+export async function notifyAutoTradeFailure(telegramId: bigint, operation: "BUY" | "SELL", tokenAddress: string, detail: string): Promise<void> {
   try {
-    await bot.api.sendMessage(telegramId.toString(), `Auto-trade gagal\nTelegram ID: ${telegramId}\nToken: ${escapeHtml(tokenAddress)}\nError: ${escapeHtml(detail)}`, { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: menuKeyboard });
+    await bot.api.sendMessage(telegramId.toString(), `Auto-trade ${operation} gagal\nToken: <code>${escapeHtml(tokenAddress)}</code>\nKeterangan: ${escapeHtml(detail)}`, { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: menuKeyboard });
   } catch (notificationError) {
     console.error(`Gagal mengirim notifikasi auto-trade ke Telegram ID ${telegramId}:`, notificationError);
   }

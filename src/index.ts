@@ -10,7 +10,6 @@ async function scan(): Promise<void> {
   if (polling) return;
   polling = true;
   try {
-    console.log("Scan stage: completed bonding curve discovery");
     const { tokens } = await discoverBondingCurveTokens();
     const status = `Screening selesai | ${new Date().toISOString()} | ${tokens.length} token bonding curve terverifikasi oleh GMGN`;
     setLatestScreeningStatus(status);
@@ -22,7 +21,7 @@ async function scan(): Promise<void> {
       try {
         const social = await enrichSocial(token);
         // Point 1a: no X mentions means we skip saving/notifying entirely, not just hiding the count.
-        if (social.xMentionCount === undefined || social.xMentionCount < config.GMGN_COMPLETED_MIN_X_MENTIONS) continue;
+        if (!social.xMentionCount || social.xMentionCount < 1) continue;
         const preCompletionVolume = preCompletionVolumes.get(token.address);
         // Fetched only now (after every other filter already passed) to avoid wasting GMGN calls on candidates
         // that end up skipped anyway.
@@ -42,7 +41,6 @@ async function scan(): Promise<void> {
     await removeCompletedFromUnbounded(tokens.map((token) => token.address));
     console.log(`Scan complete: ${tokens.length} verified bonding-curve token(s)`);
 
-    console.log("Scan stage: unbounded discovery");
     const { tokens: unboundedTokens } = await discoverUnboundedTokens();
     for (const token of unboundedTokens) {
       try {
@@ -51,7 +49,7 @@ async function scan(): Promise<void> {
         // this cycle rather than guessing, but do not treat it as a disqualification signal.
         if (social.mentionCheckFailed) continue;
         // Point 1a: no X mentions means we skip saving/notifying entirely, not just hiding the count.
-        if (social.xMentionCount === undefined || social.xMentionCount < config.GMGN_UNBOUNDED_MIN_X_MENTIONS) continue;
+        if (!social.xMentionCount || social.xMentionCount < 1) continue;
         const athMarketCap = await fetchAthMarketCap(config.GMGN_CHAIN, token.address, token.totalSupply);
         const { isNew } = await saveUnboundedToken(token, social, athMarketCap);
         if (isNew) {
@@ -69,12 +67,11 @@ async function scan(): Promise<void> {
     // rose from <=20% at capture to 22.92% nine minutes later for the same token).
     await pruneExpiredUnboundedTokens(60 * 60 * 1000);
 
-    console.log("Scan stage: early discovery");
     const earlyTokens = await discoverEarlyTokens();
     for (const token of earlyTokens) {
       try {
         const social = await enrichSocial(token);
-        if (social.mentionCheckFailed || social.xMentionCount === undefined || social.xMentionCount < config.GMGN_EARLY_MIN_X_MENTIONS) continue;
+        if (social.mentionCheckFailed || !social.xMentionCount || social.xMentionCount < 1) continue;
         const { isNew } = await saveEarlyToken(token, social);
         if (isNew) {
           await handleEarlyTokenForAutoTrade(token);
@@ -106,8 +103,7 @@ await bot.api.setMyCommands([
   { command: "early", description: "Early Token" },
   { command: "wallet", description: "Wallet SOL" },
   { command: "configtrade", description: "Konfigurasi auto-trade" },
-  { command: "tradepositions", description: "Open trade positions" },
-  { command: "buy", description: "Manual buy token" }
+  { command: "tradepositions", description: "Open trade positions" }
 ]);
 await bot.api.setChatMenuButton({ menu_button: { type: "commands" } });
 void bot.start({ onStart: () => console.log("Telegram bot started") }).catch((error) => {
