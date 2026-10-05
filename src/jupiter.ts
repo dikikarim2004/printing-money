@@ -3,6 +3,12 @@ import { config } from "./config.js";
 import { solanaConnection } from "./wallet.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+export const SOLANA_CHAIN_ID = 101;
+
+export function assertJupiterChainId(chainId: number): void {
+  if (chainId === 4663) throw new Error("Routing guard: chainId 4663 must never be sent to Jupiter/Solana");
+  if (chainId !== SOLANA_CHAIN_ID) throw new Error(`Routing guard: Jupiter requires Solana chainId ${SOLANA_CHAIN_ID}, received ${chainId}`);
+}
 
 type JupiterOrder = {
   transaction?: string;
@@ -15,7 +21,7 @@ type JupiterOrder = {
 };
 
 function jupiterHeaders(): HeadersInit {
-  if (!config.JUPITER_API_KEY) throw new Error("JUPITER_API_KEY belum dikonfigurasi");
+  if (!config.JUPITER_API_KEY) throw new Error("JUPITER_API_KEY is not configured");
   return { accept: "application/json", "x-api-key": config.JUPITER_API_KEY };
 }
 
@@ -28,17 +34,30 @@ async function readJsonResponse(response: Response): Promise<Record<string, unkn
   throw new Error(`Jupiter returned non-JSON response (${response.status}): ${body.slice(0, 200)}`);
 }
 
+let referralSolFeeAccount: string | undefined;
+let referralSolFeeAccountPromise: Promise<string> | undefined;
+
 async function referralSolTokenAccount(): Promise<string> {
-  const accounts = await Promise.race([
-    solanaConnection.getParsedTokenAccountsByOwner(new PublicKey(config.JUPITER_REFERRAL_ACCOUNT), { mint: new PublicKey(SOL_MINT) }),
-    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Jupiter referral SOL account lookup timed out")), 5000))
-  ]);
-  const account = accounts.value.find((item) => {
+  if (referralSolFeeAccount) return referralSolFeeAccount;
+  if (referralSolFeeAccountPromise) return referralSolFeeAccountPromise;
+  referralSolFeeAccountPromise = (async () => {
+    const accounts = await Promise.race([
+      solanaConnection.getParsedTokenAccountsByOwner(new PublicKey(config.JUPITER_REFERRAL_ACCOUNT), { mint: new PublicKey(SOL_MINT) }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Jupiter referral SOL fee account lookup timed out")), 10000))
+    ]);
+    const account = accounts.value.find((item) => {
     const info = item.account.data.parsed.info as { mint?: string; isNative?: boolean };
     return info.mint === SOL_MINT && info.isNative === true;
-  });
-  if (!account) throw new Error("Jupiter referral SOL token account was not found");
-  return account.pubkey.toBase58();
+    });
+    if (!account) throw new Error(`Jupiter referral fee account was not found for ${config.JUPITER_REFERRAL_ACCOUNT}`);
+    referralSolFeeAccount = account.pubkey.toBase58();
+    return referralSolFeeAccount;
+  })();
+  try {
+    return await referralSolFeeAccountPromise;
+  } finally {
+    referralSolFeeAccountPromise = undefined;
+  }
 }
 
 export async function getJupiterOrder(inputMint: string, outputMint: string, amountBaseUnits: bigint, taker: string): Promise<JupiterOrder> {
@@ -73,7 +92,9 @@ export async function getJupiterOrder(inputMint: string, outputMint: string, amo
   return { transaction: built.swapTransaction, inputAmount: String(quote.inAmount ?? amountBaseUnits), outputAmount: String(quote.outAmount ?? ""), feeBps: isSellToSol ? config.JUPITER_REFERRAL_FEE_BPS : 0, feeMint: isSellToSol ? config.JUPITER_REFERRAL_ACCOUNT : undefined };
 }
 
-export async function executeJupiterSwap(encryptedPrivateKey: string, inputMint: string, outputMint: string, amountBaseUnits: bigint, dryRun: boolean): Promise<{ dryRun: boolean; requestId?: string; signature?: string; order: JupiterOrder }> {
+export async function executeJupiterSwap(encryptedPrivateKey: string, inputMint: string, outputMint: string, amountBaseUnits: bigint, dryRun: boolean, chainId = SOLANA_CHAIN_ID): Promise<{ dryRun: boolean; requestId?: string; signature?: string; order: JupiterOrder }> {
+  assertJupiterChainId(chainId);
+  console.log(`[SOL:Jupiter] swap start | input=${inputMint} | output=${outputMint} | dryRun=${dryRun}`);
   const wallet = Keypair.fromSecretKey(await decryptForSwap(encryptedPrivateKey));
   const order = await getJupiterOrder(inputMint, outputMint, amountBaseUnits, wallet.publicKey.toBase58());
   if (dryRun) return { dryRun: true, requestId: order.requestId, order };
@@ -83,6 +104,7 @@ export async function executeJupiterSwap(encryptedPrivateKey: string, inputMint:
   transaction.sign([wallet]);
   const signature = await solanaConnection.sendRawTransaction(transaction.serialize(), { skipPreflight: false, maxRetries: 3 });
   await solanaConnection.confirmTransaction(signature, "confirmed");
+  console.log(`[SOL:Jupiter] swap confirmed | tx=${signature}`);
   return { dryRun: false, signature, order };
 }
 
