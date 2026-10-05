@@ -1,5 +1,6 @@
 export type DiscoveredToken = {
   address: string;
+  chain?: string;
   symbol?: string;
   name?: string;
   bondingAt: Date;
@@ -32,6 +33,7 @@ export type TokenListItem = DiscoveredToken & {
 // "Good Unbounded Token": bonding curve not yet at 100%, but dex paid, bundler <= 20%, organic (not likely rugged).
 export type UnboundedDiscoveredToken = {
   address: string;
+  chain?: string;
   symbol?: string;
   name?: string;
   progress: number;
@@ -68,3 +70,6 @@ export type EarlyTokenListItem = EarlyDiscoveredToken & {
   athMarketCap: number | null;
   createdAt: Date;
 };
+
+export const SUPPORTED_CHAINS = ["SOLANA", "ROBINHOOD"] as const;
+export type SupportedChain = typeof SUPPORTED_CHAINS[number];

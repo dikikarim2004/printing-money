@@ -8,7 +8,8 @@ datasource db {
 }
 
 model Token {
-  address       String   @id
+  address       String
+  chain         String   @default("sol")
   symbol        String?
   name          String?
   bondingAt    DateTime
@@ -28,6 +29,7 @@ model Token {
 
   @@index([bondingAt])
   @@index([xMentionCount])
+  @@id([address, chain])
 }
 
 model Chat {
@@ -46,8 +48,55 @@ model TelegramUser {
   @@map("telegram_users")
 }
 
+model Wallet {
+  id                  String   @id @default(cuid())
+  telegramId          BigInt
+  chain               String
+  label               String?
+  walletAddress       String
+  encryptedPrivateKey String
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([telegramId, chain])
+  @@unique([telegramId, walletAddress])
+  @@map("user_wallets")
+}
+
+model UserFeedConfig {
+  telegramId                  BigInt   @id
+  chain                       String   @default("SOLANA")
+  activeSolanaWalletId        String?
+  activeRobinhoodWalletId     String?
+  completedTypes              String   @default("completed")
+  completedLimit              Int      @default(80)
+  completedMaxBundlerRate     Float    @default(0.2)
+  completedMaxBondingAgeHours Float    @default(24)
+  completedMaxTokenAgeHours   Float    @default(1)
+  completedMinXMentions       Int      @default(1)
+  unboundedTypes              String   @default("new_creation,near_completion")
+  unboundedLimit              Int      @default(80)
+  unboundedMaxBundlerRate     Float    @default(0.2)
+  unboundedMaxRugRatio         Float    @default(0.3)
+  unboundedMinVolume24h        Float    @default(50000)
+  unboundedMaxTokenAgeHours    Float    @default(1)
+  unboundedMinXMentions        Int      @default(1)
+  earlyTypes                  String   @default("new_creation")
+  earlyLimit                  Int      @default(80)
+  earlyMinMarketCap            Float    @default(2000)
+  earlyMaxMarketCap            Float    @default(3000)
+  earlyMinVolume24h            Float    @default(20000)
+  earlyMaxTokenAgeMinutes      Float    @default(15)
+  earlyMinXMentions            Int      @default(20)
+  createdAt                   DateTime @default(now())
+  updatedAt                   DateTime @updatedAt
+
+  @@map("user_feed_configs")
+}
+
 model EarlyToken {
-  address        String   @id
+  address        String
+  chain          String   @default("sol")
   symbol         String?
   name           String?
   progress       Float
@@ -65,12 +114,15 @@ model EarlyToken {
   updatedAt      DateTime @updatedAt
 
   @@index([createdAt])
+  @@id([address, chain])
   @@map("early_token")
 }
 
 model KonfigTrader {
   telegramId                 BigInt  @id
   solAmountTradePerPosition  Float   @default(0.001)
+  ethAmountTradePerPosition  Float   @default(0.001)
+  autoTradeFeed              String  @default("EARLY")
   maxTradePositions          Int     @default(1)
   takeProfit1SellPercent     Float   @default(100)
   takeProfit1TargetPercent   Float   @default(200)
@@ -92,9 +144,12 @@ enum TradePositionStatus {
 
 model TradePosition {
   id                    String              @id @default(cuid())
+  chain                 String              @default("sol")
   txHash                String?
   telegramId            BigInt
   amountSol             Float
+  amountNative          Float?
+  nativeSymbol          String?
   tokenPrice            Float
   tokenSymbol           String?
   tokenAddress          String
@@ -118,7 +173,8 @@ model TradePosition {
 }
 
 model TokenUnboundedFilter {
-  address       String   @id
+  address       String
+  chain         String   @default("sol")
   symbol        String?
   name          String?
   progress      Float
@@ -136,5 +192,6 @@ model TokenUnboundedFilter {
   updatedAt     DateTime @updatedAt
 
   @@index([createdAt])
+  @@id([address, chain])
   @@map("token_unbounded_filter")
 }

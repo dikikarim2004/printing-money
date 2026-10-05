@@ -1,36 +1,64 @@
 import { config } from "./config.js";
-import { discoverBondingCurveTokens, discoverEarlyTokens, discoverUnboundedTokens, fetchAthMarketCap } from "./gmgn.js";
+import { discoverBondingCurveTokens, discoverEarlyTokens, discoverUnboundedTokens, fetchAthMarketCap, isGmgnCoolingDown } from "./gmgn.js";
 import { enrichSocial } from "./enrichment.js";
-import { prisma, pumpUrl, pruneExpiredUnboundedTokens, removeCompletedFromUnbounded, getUnboundedVolumes, saveEarlyToken, saveToken, saveUnboundedToken } from "./repository.js";
+import { ensureAllUserChainWallets, getUserFeedConfig, prisma, tokenUrl, pruneExpiredUnboundedTokens, removeCompletedFromUnbounded, getUnboundedVolumes, listUserFeedConfigs, saveEarlyToken, saveToken, saveUnboundedToken } from "./repository.js";
 import { bot, notifyNewEarlyToken, notifyNewToken, notifyNewUnboundedToken, setLatestScreeningStatus } from "./telegram.js";
-import { handleEarlyTokenForAutoTrade, startAutoTradeWorker } from "./autotrade.js";
+import { handleTokenForAutoTrade, startAutoTradeWorker } from "./autotrade.js";
 
 let polling = false;
 async function scan(): Promise<void> {
   if (polling) return;
+  if (isGmgnCoolingDown()) {
+    const message = "GMGN screening paused during rate-limit cooldown; no requests are being sent.";
+    setLatestScreeningStatus(message);
+    return;
+  }
   polling = true;
   try {
-    console.log("Scan stage: completed bonding curve discovery");
-    const { tokens } = await discoverBondingCurveTokens();
-    const status = `Screening selesai | ${new Date().toISOString()} | ${tokens.length} token bonding curve terverifikasi oleh GMGN`;
+    const feedConfigs = await listUserFeedConfigs();
+    const runtimeOptions = feedConfigs.length ? feedConfigs.map((feed) => ({
+      chain: feed.chain === "SOLANA" ? config.GMGN_CHAIN : config.ROBINHOOD_GMGN_CHAIN,
+      completedTypes: feed.completedTypes,
+      completedLimit: feed.completedLimit,
+      unboundedTypes: feed.unboundedTypes,
+      unboundedLimit: feed.unboundedLimit,
+      unboundedMinVolume24h: feed.unboundedMinVolume24h,
+      earlyTypes: feed.earlyTypes,
+      earlyLimit: feed.earlyLimit,
+      earlyMinVolume24h: feed.earlyMinVolume24h,
+      earlyMaxTokenAgeMinutes: feed.earlyMaxTokenAgeMinutes
+    })) : [undefined];
+    const uniqueRuntimeOptions = [...new Map(runtimeOptions.map((options) => [options?.chain ?? config.GMGN_CHAIN, options])).values()];
+    const completedResults = [];
+    for (const options of uniqueRuntimeOptions) {
+      try {
+        const result = await discoverBondingCurveTokens(options);
+        completedResults.push(result);
+        console.log(`GMGN completed screening | chain=${options?.chain ?? config.GMGN_CHAIN} | candidates=${result.tokens.length}`);
+      } catch (error) {
+        console.error(`GMGN completed screening failed | chain=${options?.chain ?? config.GMGN_CHAIN}:`, error);
+        completedResults.push({ tokens: [], reliable: false });
+      }
+    }
+    const tokens = [...new Map(completedResults.flatMap((result, index) => result.tokens.map((token) => ({ ...token, chain: uniqueRuntimeOptions[index]?.chain ?? config.GMGN_CHAIN }))).map((token) => [`${token.chain}:${token.address}`, token])).values()];
+    const status = `Screening complete | ${new Date().toISOString()} | ${tokens.length} GMGN-verified bonding-curve token(s)`;
     setLatestScreeningStatus(status);
     console.log(status);
     // Must be read before removeCompletedFromUnbounded deletes these rows: it holds the volume while the
     // bonding curve was still <100%, which is what jumlah_volume should be frozen to (point 1 revision).
-    const preCompletionVolumes = await getUnboundedVolumes(tokens.map((token) => token.address));
+    const preCompletionVolumes = await getUnboundedVolumes(tokens.map((token) => ({ address: token.address, chain: token.chain ?? config.GMGN_CHAIN })));
     for (const token of tokens) {
       try {
         const social = await enrichSocial(token);
-        // Point 1a: no X mentions means we skip saving/notifying entirely, not just hiding the count.
-        if (social.xMentionCount === undefined || social.xMentionCount < config.GMGN_COMPLETED_MIN_X_MENTIONS) continue;
-        const preCompletionVolume = preCompletionVolumes.get(token.address);
+        const tokenChain = token.chain ?? config.GMGN_CHAIN;
+        const preCompletionVolume = preCompletionVolumes.get(`${tokenChain}:${token.address}`);
         // Fetched only now (after every other filter already passed) to avoid wasting GMGN calls on candidates
         // that end up skipped anyway.
-        const athMarketCap = await fetchAthMarketCap(config.GMGN_CHAIN, token.address, token.totalSupply);
+        const athMarketCap = await fetchAthMarketCap(tokenChain, token.address, token.totalSupply);
         const { isNew } = await saveToken(token, social, preCompletionVolume, athMarketCap);
         console.log(`Bonding curve detected by GMGN | ${token.symbol ?? token.name ?? "Unknown token"} | ${token.address} | ${token.bondingAt.toISOString()} | is_on_curve=${String(token.isOnCurve)}`);
         if (isNew) {
-          await notifyNewToken({ ...token, pumpUrl: pumpUrl(token.address), xMentionCount: social.xMentionCount ?? null, jumlah_volume: preCompletionVolume ?? token.volume24h ?? null, athMarketCap: athMarketCap ?? null });
+          await notifyNewToken({ ...token, pumpUrl: tokenUrl(tokenChain, token.address), xMentionCount: social.xMentionCount ?? null, jumlah_volume: preCompletionVolume ?? token.volume24h ?? null, athMarketCap: athMarketCap ?? null });
         }
       } catch (error) {
         console.error(`Could not save ${token.address}:`, error);
@@ -39,24 +67,35 @@ async function scan(): Promise<void> {
     // Point 3: a token that just reached 100% no longer belongs in the not-yet-100% unbounded table.
     // Safe unconditionally: removeCompletedFromUnbounded only deletes addresses explicitly IN this list.
     // Uses the full completed-curve list regardless of the X-mentions gate above (curve status, not notification eligibility).
-    await removeCompletedFromUnbounded(tokens.map((token) => token.address));
+    await removeCompletedFromUnbounded(tokens.map((token) => ({ address: token.address, chain: token.chain ?? config.GMGN_CHAIN })));
     console.log(`Scan complete: ${tokens.length} verified bonding-curve token(s)`);
 
-    console.log("Scan stage: unbounded discovery");
-    const { tokens: unboundedTokens } = await discoverUnboundedTokens();
+    const unboundedResults = [];
+    for (const options of uniqueRuntimeOptions) {
+      if (isGmgnCoolingDown()) break;
+      try {
+        const result = await discoverUnboundedTokens(options);
+        unboundedResults.push(result);
+        console.log(`GMGN unbounded screening | chain=${options?.chain ?? config.GMGN_CHAIN} | candidates=${result.tokens.length}`);
+      } catch (error) {
+        console.error(`GMGN unbounded screening failed | chain=${options?.chain ?? config.GMGN_CHAIN}:`, error);
+        unboundedResults.push({ tokens: [], reliable: false });
+      }
+    }
+    const unboundedTokens = [...new Map(unboundedResults.flatMap((result, index) => result.tokens.map((token) => ({ ...token, chain: uniqueRuntimeOptions[index]?.chain ?? config.GMGN_CHAIN }))).map((token) => [`${token.chain}:${token.address}`, token])).values()];
     for (const token of unboundedTokens) {
       try {
         const social = await enrichSocial(token);
         // A transient fxtwitter failure (had a real tweet link, but couldn't verify it right now): skip saving
         // this cycle rather than guessing, but do not treat it as a disqualification signal.
         if (social.mentionCheckFailed) continue;
-        // Point 1a: no X mentions means we skip saving/notifying entirely, not just hiding the count.
-        if (social.xMentionCount === undefined || social.xMentionCount < config.GMGN_UNBOUNDED_MIN_X_MENTIONS) continue;
-        const athMarketCap = await fetchAthMarketCap(config.GMGN_CHAIN, token.address, token.totalSupply);
+        const tokenChain = token.chain ?? config.GMGN_CHAIN;
+        const athMarketCap = await fetchAthMarketCap(tokenChain, token.address, token.totalSupply);
         const { isNew } = await saveUnboundedToken(token, social, athMarketCap);
         if (isNew) {
+          await handleTokenForAutoTrade(token, "UNBOUNDED");
           console.log(`Good Unbounded Token detected by GMGN | ${token.symbol ?? token.name ?? "Unknown token"} | ${token.address} | progress=${token.progress}`);
-          await notifyNewUnboundedToken({ ...token, pumpUrl: pumpUrl(token.address), xMentionCount: social.xMentionCount ?? null, jumlah_volume: token.volume24h ?? null, athMarketCap: athMarketCap ?? null, createdAt: new Date() });
+          await notifyNewUnboundedToken({ ...token, pumpUrl: tokenUrl(tokenChain, token.address), xMentionCount: social.xMentionCount ?? null, jumlah_volume: token.volume24h ?? null, athMarketCap: athMarketCap ?? null, createdAt: new Date() });
         }
       } catch (error) {
         console.error(`Could not save unbounded ${token.address}:`, error);
@@ -69,16 +108,27 @@ async function scan(): Promise<void> {
     // rose from <=20% at capture to 22.92% nine minutes later for the same token).
     await pruneExpiredUnboundedTokens(60 * 60 * 1000);
 
-    console.log("Scan stage: early discovery");
-    const earlyTokens = await discoverEarlyTokens();
+    const earlyResults = [];
+    for (const options of uniqueRuntimeOptions) {
+      if (isGmgnCoolingDown()) break;
+      try {
+        const result = await discoverEarlyTokens(options);
+        earlyResults.push(result);
+        console.log(`GMGN early screening | chain=${options?.chain ?? config.GMGN_CHAIN} | candidates=${result.length}`);
+      } catch (error) {
+        console.error(`GMGN early screening failed | chain=${options?.chain ?? config.GMGN_CHAIN}:`, error);
+        earlyResults.push([]);
+      }
+    }
+    const earlyTokens = [...new Map(earlyResults.flatMap((result, index) => result.map((token) => ({ ...token, chain: uniqueRuntimeOptions[index]?.chain ?? config.GMGN_CHAIN }))).map((token) => [`${token.chain}:${token.address}`, token])).values()];
     for (const token of earlyTokens) {
       try {
         const social = await enrichSocial(token);
-        if (social.mentionCheckFailed || social.xMentionCount === undefined || social.xMentionCount < config.GMGN_EARLY_MIN_X_MENTIONS) continue;
+        if (social.mentionCheckFailed) continue;
         const { isNew } = await saveEarlyToken(token, social);
         if (isNew) {
-          await handleEarlyTokenForAutoTrade(token);
-          await notifyNewEarlyToken({ ...token, pumpUrl: pumpUrl(token.address), xMentionCount: social.xMentionCount, jumlah_volume: token.volume24h ?? null, athMarketCap: null, createdAt: new Date() });
+          await handleTokenForAutoTrade(token, "EARLY");
+          await notifyNewEarlyToken({ ...token, pumpUrl: tokenUrl(token.chain ?? config.GMGN_CHAIN, token.address), xMentionCount: social.xMentionCount ?? null, jumlah_volume: token.volume24h ?? null, athMarketCap: null, createdAt: new Date() });
         }
       } catch (error) {
         console.error(`Could not save early token ${token.address}:`, error);
@@ -86,7 +136,7 @@ async function scan(): Promise<void> {
     }
   } catch (error) {
     console.error("Scan failed:", error);
-    const message = `Screening gagal: ${error instanceof Error ? error.message : "unknown error"}`;
+    const message = `Screening failed: ${error instanceof Error ? error.message : "unknown error"}`;
     setLatestScreeningStatus(message);
     console.error(message);
   } finally {
@@ -95,18 +145,21 @@ async function scan(): Promise<void> {
 }
 
 await prisma.$connect();
+await ensureAllUserChainWallets();
 await bot.api.setMyCommands([
-  { command: "start", description: "Tampilkan menu utama" },
-  { command: "menu", description: "Tampilkan menu utama" },
-  { command: "status", description: "Lihat status screening" },
-  { command: "latest", description: "Token terbaru" },
-  { command: "all", description: "Semua token" },
-  { command: "unbounded", description: "Good Unbounded Token" },
-  { command: "topmentions", description: "Top mention X" },
-  { command: "early", description: "Early Token" },
-  { command: "wallet", description: "Wallet SOL" },
-  { command: "configtrade", description: "Konfigurasi auto-trade" },
-  { command: "tradepositions", description: "Open trade positions" }
+  { command: "start", description: "Show the main menu" },
+  { command: "menu", description: "Show the main menu" },
+  { command: "status", description: "Show screening status" },
+  { command: "latest", description: "Show latest tokens" },
+  { command: "all", description: "Show all tokens" },
+  { command: "unbounded", description: "Show unbounded feed" },
+  { command: "topmentions", description: "Show top X mentions" },
+  { command: "early", description: "Show early feed" },
+  { command: "wallet", description: "Manage wallets" },
+  { command: "wallets", description: "Manage wallets" },
+  { command: "configsystem", description: "Configure your feed and chain" },
+  { command: "configtrade", description: "Configure auto-trade" },
+  { command: "tradepositions", description: "Show open trade positions" }
 ]);
 await bot.api.setChatMenuButton({ menu_button: { type: "commands" } });
 void bot.start({ onStart: () => console.log("Telegram bot started") }).catch((error) => {
